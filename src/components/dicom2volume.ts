@@ -5,10 +5,19 @@
 import { DataSet } from "dicom-parser";
 import * as THREE from 'three';
 import { Volume } from "./Volume";
+import type { VolumeMetadata, Modality } from "../types/VolumeMetadata";
 
 interface MyDataSet extends DataSet {
     decompressed: ArrayBuffer;
   }
+
+const detectModality = (d: MyDataSet): Modality => {
+    const m = (d.string("x00080060") ?? "").toUpperCase();
+    if (m === "PT" || m === "PET") return "PT";
+    if (m === "CT") return "CT";
+    if (m === "MR") return "MR";
+    return "OTHER";
+}
 
 export const generateVolumeFromDicom = (dcmList: MyDataSet[]) => {
 
@@ -17,7 +26,7 @@ export const generateVolumeFromDicom = (dcmList: MyDataSet[]) => {
     try{
         suvFactor = getSuvFactor(dcmList) ?? 1;
     }catch{
-        
+
     }
 
     const d = dcmList[0];
@@ -90,6 +99,37 @@ export const generateVolumeFromDicom = (dcmList: MyDataSet[]) => {
         }
     }
 
+    const modality = detectModality(d);
+    const metadata: VolumeMetadata = {
+        modality,
+        seriesUID: d.string("x0020000e") ?? undefined,
+        seriesDescription: d.string("x0008103e") ?? undefined,
+        suvFactor,
+        units: d.string("x00541001") ?? undefined,
+        patientWeightKg: d.floatString("x00101030") ?? undefined,
+    };
+    if (modality === "PT") {
+        try {
+            const acq = d.string("x00080032");
+            if (acq) metadata.acquisitionTimeSec = parseSecond6digits(acq);
+            let hl = d.floatString("x00181075");
+            if (hl == null && d.elements.x00540016?.items?.[0]?.dataSet) {
+                hl = d.elements.x00540016.items[0].dataSet.floatString("x00181075") ?? undefined;
+            }
+            if (hl != null) metadata.radionuclideHalfLifeSec = hl;
+            let dose = d.floatString("x00181074");
+            if (dose == null && d.elements.x00540016?.items?.[0]?.dataSet) {
+                dose = d.elements.x00540016.items[0].dataSet.floatString("x00181074") ?? undefined;
+            }
+            if (dose != null) metadata.radionuclideTotalDoseBq = dose;
+            let dst = d.string("x00181072");
+            if (dst == null && d.elements.x00540016?.items?.[0]?.dataSet) {
+                dst = d.elements.x00540016.items[0].dataSet.string("x00181072") ?? undefined;
+            }
+            if (dst) metadata.doseStartTimeSec = parseSecond6digits(dst);
+        } catch {}
+    }
+
     const dicomVolume: Volume = {
         nx: nx,
         ny: ny,
@@ -99,6 +139,7 @@ export const generateVolumeFromDicom = (dcmList: MyDataSet[]) => {
         vectorY: vy,
         vectorZ: vz,
         voxel: vox,
+        metadata,
     };
 
     return dicomVolume;

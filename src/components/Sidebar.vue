@@ -1,6 +1,19 @@
 <script setup lang="ts">
-
 import { ref } from 'vue';
+import SeriesList from './SeriesList.vue';
+
+defineProps<{
+  seriesSummaries?: Array<{
+    index: number;
+    description: string;
+    modality: string;
+    matrixSize: string;
+    voxelSize: string;
+    fileCount: number;
+    hasVolume: boolean;
+    thumbnail: string | null;
+  }>;
+}>();
 
 const emit = defineEmits([
   "fileLoaded",
@@ -24,130 +37,155 @@ const emit = defineEmits([
   "phantom3",
   "fusion",
   "maximize",
+  "redraw",
+  "selectSeries",
 ]);
 
-// const leftButtonFunction = ref('none');
+const presetClicked = (e: string) => emit("presetSelected", e);
+const changeSeries = (e: number) => emit("changeSeries", e);
+const changeSlice = (e: number) => emit("changeSlice", e);
 
-const openFile: any = ref(null);
-const openDir: any = ref(null);
-const openFileClicked = () => {openFile.value.click()}
-const openDirClicked = () => {openDir.value.click()}
-const dicom_open = (e: any) => emit("fileLoaded", e.target.files[0]);
-const dicom_dir_open = (e: any) => emit("dirLoaded", e.target.files);
-// const openSampleClicked = () => emit("openSample");
-// const leftButtonFunctionChanged = (func: string) =>{
-//   leftButtonFunction.value = func;
-//   emit("leftButtonFunctionChanged", leftButtonFunction.value);
-// }
-const presetClicked = (e:string) => emit("presetSelected", e);
-const changeSeries = (e:number) => emit("changeSeries", e);
-const changeSlice = (e:number) => emit("changeSlice", e);
-
-const showUnderConstruction = ref(false);
+const showAdvanced = ref(false);
 const showSummary = ref(false);
 const showTag = ref(false);
 
+const wPresets = [
+  { id: 'Lung',  label: 'Lung'  },
+  { id: 'Med',   label: 'Med'   },
+  { id: 'Abd',   label: 'Abd'   },
+  { id: 'Bone',  label: 'Bone'  },
+  { id: 'Brain', label: 'Brain' },
+  { id: 'Fat',   label: 'Fat'   },
+];
 </script>
 
 <template>
+  <div class="mv-sidebar">
 
-  <v-container fluid>
+    <!-- Series -->
+    <section class="mv-section">
+      <div class="mv-section-title">
+        <v-icon icon="mdi-folder-multiple-image" size="x-small" />
+        Series
+      </div>
+      <div class="mv-btn-row mb-2">
+        <v-btn size="x-small" variant="tonal" @click="changeSeries(-1)">
+          <v-icon icon="mdi-arrow-left" size="small" />
+        </v-btn>
+        <v-btn size="x-small" variant="tonal" @click="changeSeries(1)">
+          <v-icon icon="mdi-arrow-right" size="small" />
+        </v-btn>
+      </div>
+      <SeriesList
+        :series="seriesSummaries ?? []"
+        @select="(i: number) => emit('selectSeries', i)"
+      />
+    </section>
 
-    <v-row>
-      <h3>Window preset</h3>
-    </v-row>
-    <v-row>
-      <v-btn @click="presetClicked('Lung')">Lung</v-btn>
-      <v-btn @click="presetClicked('Med')">Med</v-btn>
-      <v-btn @click="presetClicked('Abd')">Abd</v-btn>
-      <v-btn @click="presetClicked('Bone')">Bone</v-btn>
-      <v-btn @click="presetClicked('Brain')">Brain</v-btn>
-      <v-btn @click="presetClicked('Fat')">Fat</v-btn>
-      <v-btn @click="presetClicked('Reset')">Reset</v-btn>
-    </v-row>
+    <!-- Slice -->
+    <section class="mv-section">
+      <div class="mv-section-title">
+        <v-icon icon="mdi-layers-triple" size="x-small" />
+        Slice
+      </div>
+      <div class="mv-btn-row">
+        <v-btn size="x-small" variant="tonal" @click="changeSlice(-100000)">
+          <v-icon icon="mdi-arrow-collapse-left" size="small" />
+        </v-btn>
+        <v-btn size="x-small" variant="tonal" @click="changeSlice(-1)">
+          <v-icon icon="mdi-arrow-left" size="small" />
+        </v-btn>
+        <v-btn size="x-small" variant="tonal" @click="changeSlice(1)">
+          <v-icon icon="mdi-arrow-right" size="small" />
+        </v-btn>
+        <v-btn size="x-small" variant="tonal" @click="changeSlice(100000)">
+          <v-icon icon="mdi-arrow-collapse-right" size="small" />
+        </v-btn>
+      </div>
+    </section>
 
-    <v-row style="padding-top: 9px;">
-      <h3>Slice</h3>
-    </v-row>
-    <v-row>
-      <v-btn @click="changeSlice(-100000)"><v-icon icon="mdi-arrow-collapse-left" ></v-icon></v-btn>
-      <v-btn @click="changeSlice(-1)"><v-icon icon="mdi-arrow-left" ></v-icon></v-btn>
-      <v-btn @click="changeSlice(1)"><v-icon icon="mdi-arrow-right" ></v-icon></v-btn>
-      <v-btn @click="changeSlice(100000)"><v-icon icon="mdi-arrow-collapse-right" ></v-icon></v-btn>
-    </v-row>
+    <!-- Window preset -->
+    <section class="mv-section">
+      <div class="mv-section-title">
+        <v-icon icon="mdi-contrast-circle" size="x-small" />
+        Window preset
+      </div>
+      <div class="mv-btn-row">
+        <v-btn
+          v-for="p in wPresets"
+          :key="p.id"
+          size="x-small"
+          variant="tonal"
+          @click="presetClicked(p.id)"
+        >{{ p.label }}</v-btn>
+        <v-btn size="x-small" variant="outlined" color="primary" @click="presetClicked('Reset')">Reset</v-btn>
+      </div>
+    </section>
 
-    <v-row style="padding-top: 9px;">
-      <h3>Color</h3>
-    </v-row>
-    <v-row>
-      <v-btn @click="emit('monochrome')">Monochrome</v-btn>
-      <v-btn @click="emit('rainbow')">Rainbow</v-btn>
-      <v-btn @click="emit('hot')">Hot</v-btn>
-      <v-btn @click="emit('reverse')">Reverse</v-btn>
-    </v-row>
+    <!-- Color -->
+    <section class="mv-section">
+      <div class="mv-section-title">
+        <v-icon icon="mdi-palette" size="x-small" />
+        Color
+      </div>
+      <div class="mv-btn-row">
+        <v-btn size="x-small" variant="tonal" @click="emit('monochrome')">Mono</v-btn>
+        <v-btn size="x-small" variant="tonal" @click="emit('rainbow')">Rainbow</v-btn>
+        <v-btn size="x-small" variant="tonal" @click="emit('hot')">Hot</v-btn>
+        <v-btn size="x-small" variant="tonal" @click="emit('reverse')">Reverse</v-btn>
+      </div>
+    </section>
 
-    <v-row style="padding-top: 9px;">
-      <h3>3D</h3>
-    </v-row>
-    <v-row>
-      <v-btn @click="emit('mpr')">MPR</v-btn>
-      <v-btn @click="emit('axi')">Axi</v-btn>
-      <v-btn @click="emit('cor')">Cor</v-btn>
-      <v-btn @click="emit('mip')">MIP</v-btn>
-      <v-btn @click="emit('smip')">sMIP</v-btn>
-    </v-row>
+    <!-- 3D / View -->
+    <section class="mv-section">
+      <div class="mv-section-title">
+        <v-icon icon="mdi-cube-outline" size="x-small" />
+        View
+      </div>
+      <div class="mv-btn-row">
+        <v-btn size="x-small" variant="tonal" @click="emit('mpr')">MPR</v-btn>
+        <v-btn size="x-small" variant="tonal" @click="emit('axi')">Axi</v-btn>
+        <v-btn size="x-small" variant="tonal" @click="emit('cor')">Cor</v-btn>
+        <v-btn size="x-small" variant="tonal" @click="emit('mip')">MIP</v-btn>
+        <v-btn size="x-small" variant="tonal" @click="emit('smip')">sMIP</v-btn>
+        <v-btn size="x-small" variant="tonal" @click="emit('fusion')">Fusion</v-btn>
+      </div>
+    </section>
 
-    <v-row style="padding-top: 9px;">
-      <h3>Series</h3>
-    </v-row>
-    <v-row>
-      <v-btn @click="changeSeries(-1)"><v-icon icon="mdi-arrow-left" ></v-icon></v-btn>
-      <v-btn @click="changeSeries(1)"><v-icon icon="mdi-arrow-right" ></v-icon></v-btn>
-    </v-row>
+    <!-- Demo / Advanced -->
+    <section class="mv-section">
+      <div class="d-flex align-center">
+        <v-btn
+          size="x-small"
+          variant="text"
+          :prepend-icon="showAdvanced ? 'mdi-chevron-down' : 'mdi-chevron-right'"
+          @click="showAdvanced = !showAdvanced"
+        >
+          Advanced
+        </v-btn>
+      </div>
 
-
-    <v-row style="padding-top: 9px;">
-      <h3>Demo</h3>
-    </v-row>
-    <v-row>
-      <v-btn @click="emit('phantom3')">Earth</v-btn>
-      <v-btn @click="emit('phantom1')">Humanoid</v-btn>
-      <v-btn @click="emit('phantom2')">Voronoi</v-btn>
-    </v-row>
-
-    <v-row style="padding-top: 9px;">
-      <v-checkbox label="Under construction" v-model="showUnderConstruction"></v-checkbox>
-    </v-row>
-    <v-row v-if="showUnderConstruction">
-      <v-btn @click="emit('fusion')">Fusion</v-btn>
-      <v-btn @click="emit('maximize')">Maximize</v-btn>
-      <v-switch label="Show summary" v-model="showSummary" style="padding-top: 36px;" hide-details></v-switch>
-      <v-switch label="Show tag" v-model="showTag" hide-details></v-switch>
-    </v-row>
-
-
-  </v-container>
-
+      <div v-if="showAdvanced" class="mt-2">
+        <div class="mv-section-title">Demo phantoms</div>
+        <div class="mv-btn-row">
+          <v-btn size="x-small" variant="tonal" @click="emit('phantom3')">Earth</v-btn>
+          <v-btn size="x-small" variant="tonal" @click="emit('phantom1')">Humanoid</v-btn>
+          <v-btn size="x-small" variant="tonal" @click="emit('phantom2')">Voronoi</v-btn>
+        </div>
+        <div class="mt-2">
+          <v-switch label="Show summary" v-model="showSummary" hide-details density="compact" />
+          <v-switch label="Show tag" v-model="showTag" hide-details density="compact" />
+        </div>
+      </div>
+    </section>
+  </div>
 </template>
 
-
 <style scoped>
-.v-btn {
-  margin: 2px 2px 2px 2px;
-  min-width: 0;
-  min-height: 0;
-  padding: 0px 10px;
-  text-transform: none;
-  transition: border-color 0.25s, box-shadow 0.25s;
-  background-color: #3e2723;
-  border: 1px solid transparent;
+.mv-sidebar {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding-top: 4px;
 }
-
-
-.v-btn:hover {
-  background-color: #4e342e;
-  box-shadow: 0 0 7px 2px #feee95;
-}
-
-
 </style>

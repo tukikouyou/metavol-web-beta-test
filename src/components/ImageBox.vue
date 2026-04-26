@@ -102,9 +102,21 @@ const drawImageCvDirect = async function(pix: Float32Array | Int16Array, wc:numb
 }
 
 
+export interface MaskOverlay {
+  mask: Uint16Array;
+  // mask は別 Volume 系（PET など）に紐づく。PET 座標での p00/v01/v10 を別途渡す。
+  p00: THREE.Vector3;
+  v01: THREE.Vector3;
+  v10: THREE.Vector3;
+  nx: number; ny: number; nz: number;
+  labelClut: number[][];
+  alpha: number;
+}
+
 const drawNiftiSlice = async function(pix: Float32Array | Int16Array,
     nx:number, ny:number, nz:number, wc:number, ww:number,
-    p00:THREE.Vector3, v01:THREE.Vector3,v10:THREE.Vector3, clut: number[][]) {
+    p00:THREE.Vector3, v01:THREE.Vector3,v10:THREE.Vector3, clut: number[][],
+    overlay?: MaskOverlay) {
 
       if (cv1.value === null || ctx === null) return;
       const canvasx = cv1.value.width;
@@ -114,6 +126,7 @@ const drawNiftiSlice = async function(pix: Float32Array | Int16Array,
 
       for (let i = 0; i<canvasy; i++){
         let v = p00.clone().addScaledVector(v01,i);
+        const vm = overlay ? overlay.p00.clone().addScaledVector(overlay.v01, i) : null;
         for (let j = 0; j<canvasx; j++){
 
           const v0 = v.clone().floor();
@@ -130,6 +143,22 @@ const drawNiftiSlice = async function(pix: Float32Array | Int16Array,
             myImageData.data[ad+1] = clut[0][1];
             myImageData.data[ad+2] = clut[0][2];
           }
+
+          if (overlay && vm){
+            const mx = Math.floor(vm.x), my = Math.floor(vm.y), mz = Math.floor(vm.z);
+            if (mx>=0 && mx<overlay.nx && my>=0 && my<overlay.ny && mz>=0 && mz<overlay.nz){
+              const lid = overlay.mask[overlay.ny*overlay.nx*mz + overlay.nx*my + mx];
+              if (lid > 0){
+                const c = overlay.labelClut[lid % overlay.labelClut.length];
+                const a = overlay.alpha;
+                myImageData.data[ad]   = myImageData.data[ad]   * (1-a) + c[0]*a;
+                myImageData.data[ad+1] = myImageData.data[ad+1] * (1-a) + c[1]*a;
+                myImageData.data[ad+2] = myImageData.data[ad+2] * (1-a) + c[2]*a;
+              }
+            }
+            vm.add(overlay.v10);
+          }
+
           ad += 4;
           v.add(v10);
         }
@@ -145,6 +174,7 @@ const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
     pix1: Float32Array | Int16Array,
     nx1:number, ny1:number, nz1:number, wc1:number, ww1:number,
     p00_1:THREE.Vector3, v01_1:THREE.Vector3,v10_1:THREE.Vector3, clut1: number[][],
+    overlay?: MaskOverlay,
   ) {
 
       if (cv1.value === null || ctx === null) return;
@@ -156,6 +186,7 @@ const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
       for (let i = 0; i<canvasy; i++){
         let v_0 = p00_0.clone().addScaledVector(v01_0,i);
         let v_1 = p00_1.clone().addScaledVector(v01_1,i);
+        const vm = overlay ? overlay.p00.clone().addScaledVector(overlay.v01, i) : null;
         for (let j = 0; j<canvasx; j++){
 
           const v0_0 = v_0.clone().floor();
@@ -189,6 +220,21 @@ const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
             myImageData.data[ad+2] += clut1[0][2] * 0.5;
           }
 
+          if (overlay && vm){
+            const mx = Math.floor(vm.x), my = Math.floor(vm.y), mz = Math.floor(vm.z);
+            if (mx>=0 && mx<overlay.nx && my>=0 && my<overlay.ny && mz>=0 && mz<overlay.nz){
+              const lid = overlay.mask[overlay.ny*overlay.nx*mz + overlay.nx*my + mx];
+              if (lid > 0){
+                const c = overlay.labelClut[lid % overlay.labelClut.length];
+                const a = overlay.alpha;
+                myImageData.data[ad]   = myImageData.data[ad]   * (1-a) + c[0]*a;
+                myImageData.data[ad+1] = myImageData.data[ad+1] * (1-a) + c[1]*a;
+                myImageData.data[ad+2] = myImageData.data[ad+2] * (1-a) + c[2]*a;
+              }
+            }
+            vm.add(overlay.v10);
+          }
+
           ad += 4;
           v_0.add(v10_0);
           v_1.add(v10_1);
@@ -204,7 +250,8 @@ const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
 const drawNiftiMip = async function(pix: Float32Array | Int16Array,
     nx:number, ny:number, nz:number, wc:number, ww:number,
     p00:THREE.Vector3, v01:THREE.Vector3,v10:THREE.Vector3,
-    angle:number, thresh:number, depth:number, clut: number[][], isSurface: boolean) {
+    angle:number, thresh:number, depth:number, clut: number[][], isSurface: boolean,
+    overlay?: MaskOverlay) {
 
       const time0 = performance.now();
 
@@ -215,16 +262,11 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
       let ad = 0;
 
       let mipData = new Float32Array(ny*nz);
-
-      // let flag = false;
-      // if (mipDataSet[angle] == null){
-      //   mipDataSet[angle] = new Float32Array(ny*nz);
-      //   flag = true;
-      // }
-
-      // const mipData = mipDataSet[angle];
-
-      // if (flag){
+      let mipMaskData: Uint16Array | null = null;
+      if (overlay && overlay.mask){
+        // overlay は PET 格子と同じ次元・affine の前提（MIP 元 PET と一致）
+        mipMaskData = new Uint16Array(ny*nz);
+      }
 
       const s = Math.sin((angle-90) *3.1415926535 / 180);
       const c = Math.cos((angle-90) *3.1415926535 / 180);
@@ -240,25 +282,33 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
         for (let k = 0; k<nz; k++){
           for (let j = 0; j<ny; j++){
             let m = -Infinity;
+            let lid = 0;
             const j0 = j - ny/2;
             for (let i=nx-1; i>=0; i--){
               const i0 = i - nx/2;
               const x = Math.floor(i0*c-j0*s)+nx/2;
               const y = Math.floor(i0*s+j0*c)+ny/2;
               if (x >= 0 && x < nx && y >= 0 && y < ny) {
-                const a = pix[k*nx*ny + y*nx + x];
+                const idx = k*nx*ny + y*nx + x;
+                const a = pix[idx];
                 if (m < a){
                   m = a;
+                }
+                if (mipMaskData){
+                  const v = overlay!.mask[idx];
+                  if (v > lid) lid = v;
                 }
               }
             }
             mipData[k*ny+j] = m;
+            if (mipMaskData) mipMaskData[k*ny+j] = lid;
           }
         }
       }else{
         for (let k = 0; k<nz; k++){
           for (let j = 0; j<ny; j++){
             let m = -Infinity;
+            let lid = 0;
             const j0 = j - ny/2;
             for (let i=nx-1; i>=0; i--){
               const i0 = i - nx/2;
@@ -272,15 +322,21 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
                   const id0 = (i-d) - nx/2;
                   const x1 = Math.floor(id0*c-j0*s)+nx/2;
                   const y1 = Math.floor(id0*s+j0*c)+ny/2;
-                  const a = pix[k*nx*ny + y1*nx + x1];
+                  const idx1 = k*nx*ny + y1*nx + x1;
+                  const a = pix[idx1];
                   if (m < a){
                     m = a;
+                  }
+                  if (mipMaskData){
+                    const v = overlay!.mask[idx1];
+                    if (v > lid) lid = v;
                   }
                 }
                 i=0;
               }
             }
             mipData[k*ny+j] = m;
+            if (mipMaskData) mipMaskData[k*ny+j] = lid;
           }
         }
       }
@@ -302,6 +358,21 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
             myImageData.data[ad] = clut[p][0];
             myImageData.data[ad+1] = clut[p][1];
             myImageData.data[ad+2] = clut[p][2];
+
+            if (mipMaskData && overlay){
+              // ny/nz と vy/vz は drawNiftiMip 呼び側で「画面の y= mip の z 軸」「画面 x= mip の x 軸」のとき有効
+              // mipData は [k*ny + j] = [z*ny + y] 形式で格納されているため、
+              // ここでは v0.z をスライス（mip 出力の z 軸）、v0.x を画面 x にマッピングして使う。
+              // 画面の y が ny 軸対応のため index は mipData と同じ [v0.z, v0.x] 順。
+              const lid = mipMaskData[nx*v0.z+v0.x];
+              if (lid > 0){
+                const cc = overlay.labelClut[lid % overlay.labelClut.length];
+                const a = overlay.alpha;
+                myImageData.data[ad]   = myImageData.data[ad]   * (1-a) + cc[0]*a;
+                myImageData.data[ad+1] = myImageData.data[ad+1] * (1-a) + cc[1]*a;
+                myImageData.data[ad+2] = myImageData.data[ad+2] * (1-a) + cc[2]*a;
+              }
+            }
           }else{
             myImageData.data[ad] = clut[0][0];
             myImageData.data[ad+1] = clut[0][1];
@@ -487,8 +558,47 @@ const showTextBottomLeft = (text: string) => {
 }
 
 
+const drawSphereOverlay = (cx: number, cy: number, radiusPx: number) => {
+  if (cv1.value === null || ctx === null) return;
+  if (radiusPx <= 0 || !isFinite(radiusPx)) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
+  ctx.strokeStyle = "#ffd24a";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx, cy, 2, 0, Math.PI * 2);
+  ctx.fillStyle = "#ffd24a";
+  ctx.fill();
+  ctx.restore();
+};
+
+const drawPolygonOverlay = (vertices: Array<[number, number]>, mode: 'add' | 'erase', closed: boolean) => {
+  if (cv1.value === null || ctx === null) return;
+  if (vertices.length === 0) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(vertices[0][0], vertices[0][1]);
+  for (let i = 1; i < vertices.length; i++){
+    ctx.lineTo(vertices[i][0], vertices[i][1]);
+  }
+  if (closed) ctx.closePath();
+  ctx.strokeStyle = mode === 'add' ? "#7fff7f" : "#ff7f7f";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.fillStyle = mode === 'add' ? "rgba(127,255,127,0.9)" : "rgba(255,127,127,0.9)";
+  for (const [x, y] of vertices){
+    ctx.beginPath();
+    ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+};
+
 defineExpose({init, show, show2, showRgb, showDirect,
-   drawNiftiSlice, drawNiftiSliceFusion, drawNiftiMip, clear});
+   drawNiftiSlice, drawNiftiSliceFusion, drawNiftiMip, clear,
+   drawSphereOverlay, drawPolygonOverlay});
 
 </script>
 

@@ -555,3 +555,30 @@ export const cluts = [
     hot,
     hot_r,
 ];
+
+// Categorical palette indexed by label id (1..N). Index 0 is reserved as background (unused).
+export const labelClut: number[][] = [
+    [0, 0, 0],
+    [255, 90, 90],
+    [90, 200, 90],
+    [90, 130, 255],
+    [255, 200, 70],
+    [220, 90, 220],
+    [70, 220, 220],
+    [255, 140, 60],
+    [180, 110, 255],
+    [120, 220, 160],
+    [220, 220, 100],
+    [255, 60, 130],
+    [70, 170, 255],
+    [200, 200, 200],
+    [255, 255, 100],
+    [180, 60, 60],
+    [60, 180, 60],
+];
+
+export const colorForLabel = (id: number): [number, number, number] => {
+    if (id <= 0) return [0, 0, 0];
+    const c = labelClut[id % labelClut.length];
+    return [c[0], c[1], c[2]];
+}

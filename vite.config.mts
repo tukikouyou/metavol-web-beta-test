@@ -20,10 +20,11 @@ export default defineConfig({
     Components(),
     ViteFonts({
       google: {
-        families: [{
-          name: 'Roboto',
-          styles: 'wght@100;300;400;500;700;900',
-        }],
+        families: [
+          { name: 'Roboto', styles: 'wght@100;300;400;500;700;900' },
+          { name: 'Inter', styles: 'wght@400;500;600;700' },
+          { name: 'JetBrains Mono', styles: 'wght@400;500' },
+        ],
       },
     }),
   ],

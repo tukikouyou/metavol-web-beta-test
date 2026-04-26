@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { solve } from './linalg'
+import type { VolumeMetadata, Modality } from '../types/VolumeMetadata';
 
 export type Volume = {
     voxel: Float32Array;
@@ -10,6 +11,25 @@ export type Volume = {
     vectorX: THREE.Vector3;
     vectorY: THREE.Vector3;
     vectorZ: THREE.Vector3;
+    metadata?: VolumeMetadata;
+}
+
+export interface SeriesEntry {
+    myDicom: any[] | null;
+    volume: Volume | null;
+}
+
+export const findVolumeBySeries = (
+    seriesList: SeriesEntry[],
+    modality: Modality
+): { volume: Volume; index: number } | null => {
+    for (let i = 0; i < seriesList.length; i++) {
+        const v = seriesList[i].volume;
+        if (v && v.metadata && v.metadata.modality === modality) {
+            return { volume: v, index: i };
+        }
+    }
+    return null;
 }
 
 export const voxelToWorld = (p: THREE.Vector3, v: Volume) => {

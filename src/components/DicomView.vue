@@ -38,13 +38,21 @@ import { generateVolumeFromDicom } from './dicom2volume.ts';
 import * as DecompressJpegLossless from "./decompressJpegLossless";
 import { Volume, voxelToWorld, worldToVoxel } from "./Volume.ts";
 import * as THREE from 'three';
-import {cluts} from './Clut.ts';
+import {cluts, labelClut} from './Clut.ts';
 import * as nifti from 'nifti-reader-js';
 import * as Phantom from './phantom.ts';
+import { useSegmentationStore } from '../stores/segmentation';
+import { sphereStatsInPet, fillPolygonOnSlice, findMaximumAxis as maxAxis } from './segmentation/maskOps';
+import SegmentationPanel from './SegmentationPanel.vue';
+import DebugInspector from './DebugInspector.vue';
+import { computed, onMounted, nextTick } from 'vue';
+
+const segStore = useSegmentationStore();
 
 
 const closingImages = defineModel<boolean>("closingImages");
 const drawer = defineModel<boolean>("drawer");
+const inspector = defineModel<boolean>("inspector");
 const leftButtonFunction = defineModel<LeftButtonFunction>("leftButtonFunction");
 
 const imageBoxW = defineModel<number>("imageBoxW");
@@ -104,6 +112,155 @@ interface SeriesList { // 複数のDICOMファイル、もしくはVolumeデー�
 }
 let seriesList: SeriesList[];
 
+// Volume cardリスト用の reactive サマリ（doSort 後に rebuildSeriesSummaries で更新）
+export interface SeriesSummary {
+  index: number;
+  description: string;
+  modality: string;
+  matrixSize: string;       // "rows x cols x slices"
+  voxelSize: string;        // "dx x dy x dz mm"
+  fileCount: number;
+  hasVolume: boolean;
+  thumbnail: string | null; // dataURL
+}
+const seriesSummaries = ref<SeriesSummary[]>([]);
+
+// ===== デバッグ機能 =====
+const debugMode = ref(false);
+const debugHoverRows = ref<Array<{
+  seriesIndex: number; modality: string; description: string;
+  i: number; j: number; k: number;
+  value: number | null; inBounds: boolean;
+}>>([]);
+const debugScreenX = ref(0);
+const debugScreenY = ref(0);
+const debugShow = ref(false);
+
+// 「画像が画面にちょうど収まる」モード。autoFitMode=true のとき
+// drawer 開閉やウィンドウリサイズで imageBoxW/H を再計算する。
+const autoFitMode = ref(false);
+
+const applyAutoFit = () => {
+  if (!autoFitMode.value) return;
+  const size = fitBoxSizeForCurrentTile();
+  imageBoxW.value = size;
+  imageBoxH.value = size;
+};
+
+// URL ?debug=1 で初期有効化、Ctrl+Shift+D で toggle
+onMounted(() => {
+  try {
+    const p = new URLSearchParams(window.location.search);
+    if (p.get('debug') === '1') debugMode.value = true;
+  } catch {}
+  window.addEventListener('keydown', (e: KeyboardEvent) => {
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'D' || e.key === 'd')){
+      e.preventDefault();
+      debugMode.value = !debugMode.value;
+      if (!debugMode.value) debugShow.value = false;
+      console.log('[debug] mode =', debugMode.value);
+    }
+  });
+  window.addEventListener('resize', applyAutoFit);
+});
+
+// drawer / inspector / tileN の変化に追従して fit
+watch([drawer, inspector, tileN], () => {
+  if (autoFitMode.value) applyAutoFit();
+});
+
+// tileN 変更後は ImageBox 群が再構成されるため、init して再描画
+watch(tileN, async () => {
+  await nextTick();
+  if (imb.value){
+    for (const a of imb.value){ a.init(); }
+  }
+  show();
+});
+
+const updateDebugHover = (boxId: number, e: MouseEvent) => {
+  if (!debugMode.value) return;
+  if (!isAnyVolumeBox(boxId)) {
+    debugShow.value = false;
+    return;
+  }
+  const [cx, cy] = getCanvasXY(e);
+  const w = screenToWorld(boxId, cx, cy);
+  const rows: typeof debugHoverRows.value = [];
+  for (let s = 0; s < seriesList.length; s++){
+    const v = seriesList[s].volume;
+    if (!v) continue;
+    const vox = worldToVoxel_(w, s);
+    const i = Math.floor(vox.x), j = Math.floor(vox.y), k = Math.floor(vox.z);
+    const inBounds = i >= 0 && i < v.nx && j >= 0 && j < v.ny && k >= 0 && k < v.nz;
+    const value = inBounds ? v.voxel[k * v.nx * v.ny + j * v.nx + i] : null;
+    rows.push({
+      seriesIndex: s,
+      modality: v.metadata?.modality ?? '-',
+      description: v.metadata?.seriesDescription ?? `S${s}`,
+      i, j, k, value, inBounds,
+    });
+  }
+  debugHoverRows.value = rows;
+  debugScreenX.value = e.clientX;
+  debugScreenY.value = e.clientY;
+  debugShow.value = true;
+};
+
+const handleDebugEditClick = (boxId: number, e: MouseEvent) => {
+  if (!debugMode.value) return false;
+  if (!e.shiftKey) return false;
+  if (!isAnyVolumeBox(boxId)) return false;
+  const [cx, cy] = getCanvasXY(e);
+  const w = screenToWorld(boxId, cx, cy);
+
+  // 編集対象シリーズを選択（Volume が複数なら一覧から選ばせる）
+  const candidates: Array<{ idx: number; v: any; descr: string }> = [];
+  for (let s = 0; s < seriesList.length; s++){
+    const v = seriesList[s].volume;
+    if (!v) continue;
+    const vox = worldToVoxel_(w, s);
+    const i = Math.floor(vox.x), j = Math.floor(vox.y), k = Math.floor(vox.z);
+    if (i < 0 || i >= v.nx || j < 0 || j >= v.ny || k < 0 || k >= v.nz) continue;
+    candidates.push({
+      idx: s,
+      v,
+      descr: `[${s}] ${v.metadata?.modality ?? '-'} ${v.metadata?.seriesDescription ?? ''} → cur=${v.voxel[k*v.nx*v.ny + j*v.nx + i].toFixed(4)} @(${i},${j},${k})`,
+    });
+  }
+  if (candidates.length === 0){
+    console.log('[debug edit] no in-bounds volume at this position');
+    return true;
+  }
+
+  let chosenIdx = candidates[0].idx;
+  if (candidates.length > 1){
+    const list = candidates.map((c, n) => `${n}: ${c.descr}`).join('\n');
+    const resp = prompt(`Edit which series?\n${list}\n\n番号を入力（0..${candidates.length-1}）:`, '0');
+    if (resp == null) return true;
+    const n = Number(resp);
+    if (!Number.isFinite(n) || n < 0 || n >= candidates.length) return true;
+    chosenIdx = candidates[n].idx;
+  }
+
+  const target = seriesList[chosenIdx].volume!;
+  const vox = worldToVoxel_(w, chosenIdx);
+  const i = Math.floor(vox.x), j = Math.floor(vox.y), k = Math.floor(vox.z);
+  const idx = k * target.nx * target.ny + j * target.nx + i;
+  const cur = target.voxel[idx];
+  const resp = prompt(`Edit voxel value\n  series ${chosenIdx} (${target.metadata?.modality ?? '-'}) at (${i},${j},${k})\n  current: ${cur}\n\n新しい値:`, String(cur));
+  if (resp == null) return true;
+  const newVal = Number(resp);
+  if (!Number.isFinite(newVal)){
+    console.warn('[debug edit] invalid value:', resp);
+    return true;
+  }
+  target.voxel[idx] = newVal;
+  console.log(`[debug edit] series ${chosenIdx} (${i},${j},${k}): ${cur} → ${newVal}`);
+  show();
+  return true;
+};
+
 const imageBoxInfos = ref<ImageBoxInfoBase[]>([]);
 const getDicomImageBoxInfo = (index: number) => imageBoxInfos.value[index] as DicomImageBoxInfo;
 const getVolumeImageBoxInfo = (index: number) => imageBoxInfos.value[index] as VolumeImageBoxInfo;
@@ -113,10 +270,15 @@ const isDicomImageBoxInfo = (i:number) => {
 const isVolumeImageBoxInfo = (i:number) => {
   return ("clut" in imageBoxInfos.value[i]) && !("clut1" in imageBoxInfos.value[i]); //この方法では、プロパティ名を変更したときにバグった。
 }
+const isFusedImageBoxInfo = (i:number) => {
+  return "clut1" in imageBoxInfos.value[i];
+}
+// Volume 系（単独 Volume または Fusion）の判定
+const isAnyVolumeBox = (i:number) => isVolumeImageBoxInfo(i) || isFusedImageBoxInfo(i);
 
 const getSelectedInfo = () => getVolumeImageBoxInfo(selectedImageBoxId.value);
 
-type LeftButtonFunction = "window" | "pan" | "zoom" | "page";
+type LeftButtonFunction = "window" | "pan" | "zoom" | "page" | "sphereROI" | "polygonROI" | "assignLabel";
 // const leftButtonFunction = ref<LeftButtonFunction>("none");
 const leftButtonFunctionChanged = (e: LeftButtonFunction) => {
   leftButtonFunction.value = e;
@@ -126,6 +288,9 @@ const initializeDicomListsImagesBoxInfos = () => {
   bagOfFiles = [];
   seriesList = [];
   imageBoxInfos.value = [defaultInfo(0), defaultInfo(1), defaultInfo(2), defaultInfo(3),defaultInfo(4),defaultInfo(5),defaultInfo(6),defaultInfo(7)];
+  seriesSummaries.value = [];
+  segStore.setPetVolume(null);
+  segStore.setCtVolume(null);
 };
 initializeDicomListsImagesBoxInfos();
 
@@ -197,10 +362,41 @@ const doOneOrAll = (id: number, action: (i:number) => void ) => {
   }
 }
 
+// Pan の実体ロジック（左ボタン pan ツール / Ctrl+中ボタン から共通利用）
+const doPan = (id: number, dx: number, dy: number) => {
+  const info = getDicomImageBoxInfo;
+  const infoV = getVolumeImageBoxInfo;
+  doOneOrAll(id, (i:number) => {
+    if (isDicomImageBoxInfo(id)){
+      const zoom = info(i).zoom!;
+      info(i).centerX -= dx / zoom;
+      info(i).centerY -= dy / zoom;
+    }else{
+      const a = infoV(i);
+      a.centerInWorld.x -= (dx * a.vecx.x + dy * a.vecy.x);
+      a.centerInWorld.y -= (dx * a.vecx.y + dy * a.vecy.y);
+      a.centerInWorld.z -= (dx * a.vecx.z + dy * a.vecy.z);
+    }
+    showImage(i);
+  });
+};
+
 const mouseMove = (e: MouseEvent) => {
   const id = getIdOfEventOccured(e);
   const info = getDicomImageBoxInfo;
   const infoV = getVolumeImageBoxInfo;
+
+  // デバッグ: マウス位置の voxel 値を更新
+  if (debugMode.value && e.buttons === 0){
+    updateDebugHover(id, e);
+  }
+
+  // 中ボタンドラッグで常時 Pan（ツール選択に関係なく）
+  // e.buttons のビット: 1=左, 2=右, 4=中。
+  if ((e.buttons & 4) !== 0){
+    doPan(id, e.movementX, e.movementY);
+    return;
+  }
 
   if (leftButtonFunction.value == "window") {
     if (e.buttons == 1) {
@@ -249,25 +445,52 @@ const mouseMove = (e: MouseEvent) => {
 
   if (leftButtonFunction.value == "pan") {
     if (e.buttons == 1) {
-      doOneOrAll(id, (i:number) => {
-        if (isDicomImageBoxInfo(id)){
-          const zoom = info(i).zoom!;
-          info(i).centerX -= e.movementX / zoom;
-          info(i).centerY -= e.movementY / zoom;
-        }else{
-          const a = infoV(i);
-          infoV(i).centerInWorld.x -= (e.movementX * a.vecx.x + e.movementY * a.vecy.x);
-          a.centerInWorld.y -= (e.movementX * a.vecx.y + e.movementY * a.vecy.y);
-          a.centerInWorld.z -= (e.movementX * a.vecx.z + e.movementY * a.vecy.z);
-        }
-        showImage(i);
-      });
+      doPan(id, e.movementX, e.movementY);
     }
   }
 }
 
 const wheel = (e: WheelEvent) => {
   const id = getIdOfEventOccured(e);
+
+  // Ctrl/Cmd + wheel → 即時ズーム（視野中心固定）
+  if (e.ctrlKey || e.metaKey){
+    const r = e.deltaY > 0 ? 1 / 1.1 : 1.1;
+    doOneOrAll(id, (i: number) => {
+      if (isDicomImageBoxInfo(i)){
+        const zoom = info(i).zoom ?? 1;
+        info(i).zoom = zoom * r;
+      } else if (isAnyVolumeBox(i)){
+        // Volume / Fusion 共通: vecx/vecy を縮小すると画面上の mm 解像度が上がり拡大表示。
+        // FusedVolumeImageBoxInfo にも vecx/vecy があるため同じ処理で OK。
+        const a = getVolumeImageBoxInfo(i);
+        a.vecx.multiplyScalar(1 / r);
+        a.vecy.multiplyScalar(1 / r);
+      }
+      showImage(i);
+    });
+    return;
+  }
+
+  // 球 ROI ツール active かつ、マウスが球内 → 半径変更
+  if (leftButtonFunction.value === "sphereROI" && segStore.sphere && segStore.petVolumeRef && isVolumeImageBoxInfo(id)){
+    const [x, y] = getCanvasXY(e as unknown as MouseEvent);
+    const w = screenToWorld(id, x, y);
+    const c = segStore.sphere.centerWorld;
+    const dx = w.x - c.x, dy = w.y - c.y, dz = w.z - c.z;
+    const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    if (dist < segStore.sphere.radiusMm){
+      const step = e.deltaY > 0 ? -2 : 2;
+      let r = segStore.sphere.radiusMm + step;
+      if (r < 1) r = 1;
+      if (r > 200) r = 200;
+      segStore.sphere.radiusMm = r;
+      recomputeSphereStats();
+      show();
+      return;
+    }
+  }
+
   doOneOrAll(id, (id: number) => {
     const change = e.deltaY > 0 ? 1 : -1;
     changeSlice(id, change);
@@ -279,8 +502,247 @@ const getIdOfEventOccured = (e:MouseEvent | WheelEvent) =>
   Number((e.currentTarget! as any).getAttribute("imageBoxId"));; // anyじゃないほうがいいのだけど
 
 const imageBoxClicked = (e:MouseEvent) => {
-  selectedImageBoxId.value = getIdOfEventOccured(e);
+  const id = getIdOfEventOccured(e);
+  selectedImageBoxId.value = id;
+
+  // デバッグ: Shift+クリックで voxel 編集（debug mode のときのみ）
+  if (debugMode.value && e.shiftKey){
+    if (handleDebugEditClick(id, e)) return;
+  }
+
+  if (leftButtonFunction.value === "sphereROI") {
+    handleSphereClick(e);
+  } else if (leftButtonFunction.value === "polygonROI") {
+    handlePolygonClick(e);
+  } else if (leftButtonFunction.value === "assignLabel") {
+    handleAssignLabelClick(e);
+  }
 }
+
+const handleAssignLabelClick = (e: MouseEvent) => {
+  const id = getIdOfEventOccured(e);
+  if (!isVolumeImageBoxInfo(id)) return;
+  if (!segStore.petVolumeRef || !segStore.componentMap) return;
+  const petIdx = findPetSeriesIndex();
+  if (petIdx < 0) return;
+  const [x, y] = getCanvasXY(e);
+  const w = screenToWorld(id, x, y);
+  const v = worldToVoxel_(w, petIdx);
+  const i = Math.round(v.x), j = Math.round(v.y), k = Math.round(v.z);
+  const pet = segStore.petVolumeRef;
+  if (i < 0 || i >= pet.nx || j < 0 || j >= pet.ny || k < 0 || k >= pet.nz) return;
+  segStore.assignLabelAtVoxel(i, j, k, segStore.currentLabelId);
+  show();
+};
+
+const getCanvasXY = (e: MouseEvent): [number, number] => {
+  const target = e.currentTarget as HTMLElement;
+  const cv = target.querySelector('canvas') as HTMLCanvasElement | null;
+  if (cv) {
+    const rect = cv.getBoundingClientRect();
+    return [e.clientX - rect.left, e.clientY - rect.top];
+  }
+  return [e.offsetX, e.offsetY];
+};
+
+const handlePolygonClick = (e: MouseEvent) => {
+  const id = getIdOfEventOccured(e);
+  if (!isVolumeImageBoxInfo(id)) return;
+  if (!segStore.petVolumeRef) return;
+
+  const [x, y] = getCanvasXY(e);
+  const cur = segStore.polygon;
+  if (!cur || !cur.inProgress || cur.imageBoxId !== id){
+    // 新規開始
+    const a = getVolumeImageBoxInfo(id);
+    const sliceAxis = maxAxis(a.vecz);
+    const planeName = determinePlaneDirection(a) as ('axial'|'coronal'|'sagittal'|'unknown');
+    // PET ボクセル空間でのスライスインデックス（描画と同じ floor 規則で決定）
+    // drawNiftiSlice は p00 + v01*y + v10*x を floor して voxel を決めるため、
+    // 画面中央画素 (W/2, H/2) の voxel index も同様に floor するのが正しい。
+    const petIdx = findPetSeriesIndex();
+    let sliceIndexInPet = 0;
+    if (petIdx >= 0){
+      const wCenter = screenToWorld(id, imageBoxW.value!/2, imageBoxH.value!/2);
+      const vc = worldToVoxel_(wCenter, petIdx);
+      const arr = [vc.x, vc.y, vc.z];
+      sliceIndexInPet = Math.floor(arr[sliceAxis]);
+    }
+    segStore.polygon = {
+      plane: planeName,
+      sliceAxis,
+      sliceIndexInPet,
+      screenVertices: [[x, y]],
+      mode: segStore.defaultPolygonMode,
+      inProgress: true,
+      imageBoxId: id,
+    };
+  } else {
+    cur.screenVertices.push([x, y]);
+  }
+  show();
+};
+
+const finalizePolygon = () => {
+  const p = segStore.polygon;
+  if (!p || !p.inProgress) return;
+  if (p.screenVertices.length < 3){
+    segStore.polygon = null;
+    show();
+    return;
+  }
+  const petIdx = findPetSeriesIndex();
+  if (petIdx < 0){
+    segStore.polygon = null;
+    show();
+    return;
+  }
+  segStore.ensureMaskAllocated();
+  if (!segStore.manualEdits || !segStore.petVolumeRef){
+    segStore.polygon = null;
+    show();
+    return;
+  }
+
+  // screen → PET voxel (u,v) 投影：sliceAxis 以外の 2 軸を採用
+  const polyVoxelUV: Array<[number, number]> = [];
+  for (const [sx, sy] of p.screenVertices){
+    const w = screenToWorld(p.imageBoxId, sx, sy);
+    const v = worldToVoxel_(w, petIdx);
+    let u: number, vv: number;
+    if (p.sliceAxis === 2){ u = v.x; vv = v.y; }
+    else if (p.sliceAxis === 1){ u = v.x; vv = v.z; }
+    else { u = v.y; vv = v.z; }
+    polyVoxelUV.push([u, vv]);
+  }
+
+  // 操作前のスライスをundoStackに保存
+  saveSliceToUndoStack(p.sliceAxis, p.sliceIndexInPet);
+
+  const writeValue = p.mode === 'add' ? segStore.currentLabelId : (0xFFFF /* erase sentinel */);
+
+  fillPolygonOnSlice({
+    pet: segStore.petVolumeRef,
+    target: segStore.manualEdits,
+    sliceAxis: p.sliceAxis,
+    sliceIndex: p.sliceIndexInPet,
+    polygonVoxelXY: polyVoxelUV,
+    writeValue,
+  });
+
+  segStore.recomputeFinalMask();
+  segStore.markManualEditsChanged();
+  segStore.polygon = null;
+  show();
+};
+
+const cancelPolygon = () => {
+  if (segStore.polygon){
+    segStore.polygon = null;
+    show();
+  }
+};
+
+const saveSliceToUndoStack = (sliceAxis: 0|1|2, sliceIndex: number) => {
+  const m = segStore.manualEdits;
+  const pet = segStore.petVolumeRef;
+  if (!m || !pet) return;
+  const { nx, ny, nz } = pet;
+  let dimU: number, dimV: number;
+  if (sliceAxis === 2){ dimU = nx; dimV = ny; }
+  else if (sliceAxis === 1){ dimU = nx; dimV = nz; }
+  else { dimU = ny; dimV = nz; }
+  const before = new Uint16Array(dimU * dimV);
+  let k = 0;
+  for (let v = 0; v < dimV; v++){
+    for (let u = 0; u < dimU; u++){
+      let idx: number;
+      if (sliceAxis === 2) idx = sliceIndex * nx * ny + v * nx + u;
+      else if (sliceAxis === 1) idx = v * nx * ny + sliceIndex * nx + u;
+      else idx = v * nx * ny + u * nx + sliceIndex;
+      before[k++] = m[idx];
+    }
+  }
+  segStore.undoStack.push({ sliceAxis, sliceIndex, before });
+  // limit stack to last 50
+  if (segStore.undoStack.length > 50) segStore.undoStack.shift();
+};
+
+const polygonUndo = () => {
+  const e = segStore.undoStack.pop();
+  if (!e) return;
+  const m = segStore.manualEdits;
+  const pet = segStore.petVolumeRef;
+  if (!m || !pet) return;
+  const { nx, ny, nz } = pet;
+  let dimU: number, dimV: number;
+  if (e.sliceAxis === 2){ dimU = nx; dimV = ny; }
+  else if (e.sliceAxis === 1){ dimU = nx; dimV = nz; }
+  else { dimU = ny; dimV = nz; }
+  let k = 0;
+  for (let v = 0; v < dimV; v++){
+    for (let u = 0; u < dimU; u++){
+      let idx: number;
+      if (e.sliceAxis === 2) idx = e.sliceIndex * nx * ny + v * nx + u;
+      else if (e.sliceAxis === 1) idx = v * nx * ny + e.sliceIndex * nx + u;
+      else idx = v * nx * ny + u * nx + e.sliceIndex;
+      m[idx] = e.before[k++];
+    }
+  }
+  segStore.recomputeFinalMask();
+  segStore.markManualEditsChanged();
+  show();
+};
+
+const onContextMenu = (e: MouseEvent) => {
+  if (leftButtonFunction.value === "polygonROI" && segStore.polygon?.inProgress){
+    e.preventDefault();
+    finalizePolygon();
+  }
+};
+
+const onDblClick = (e: MouseEvent) => {
+  if (leftButtonFunction.value === "polygonROI" && segStore.polygon?.inProgress){
+    e.preventDefault();
+    finalizePolygon();
+  }
+};
+
+const onKeyDown = (e: KeyboardEvent) => {
+  if (e.key === "Escape" && segStore.polygon?.inProgress){
+    cancelPolygon();
+  } else if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey)){
+    e.preventDefault();
+    polygonUndo();
+  }
+};
+
+if (typeof window !== "undefined"){
+  window.addEventListener("keydown", onKeyDown);
+}
+
+const handleSphereClick = (e: MouseEvent) => {
+  const id = getIdOfEventOccured(e);
+  if (!isVolumeImageBoxInfo(id)) return;
+  if (!segStore.petVolumeRef) return;
+  const [x, y] = getCanvasXY(e);
+  const w = screenToWorld(id, x, y);
+  const radius = segStore.sphere?.radiusMm ?? 10;
+  segStore.setSphere(w, radius);
+  recomputeSphereStats();
+  show();
+};
+
+const recomputeSphereStats = () => {
+  const s = segStore.sphere;
+  const pet = segStore.petVolumeRef;
+  if (!s || !pet) return;
+  const stats = sphereStatsInPet(pet, s.centerWorld, s.radiusMm);
+  s.suvMax = stats.suvMax;
+  s.suvMean = stats.suvMean;
+  s.suvStd = stats.suvStd;
+  s.voxelCount = stats.voxelCount;
+};
 
 const changeSeries = (i:number) => {
   const j = imageBoxInfos.value[selectedImageBoxId.value].currentSeriesNumber;
@@ -292,6 +754,43 @@ const changeSeries = (i:number) => {
     show();
   }
 }
+
+const onSelectSeriesFromCard = (idx: number) => {
+  if (idx < 0 || idx >= seriesList.length) return;
+  const id = selectedImageBoxId.value;
+  const info = imageBoxInfos.value[id];
+  // 既存の Box が DICOM 表示中なら currentSeriesNumber を切替、Volume 表示中なら mpr_ で再構築
+  if (isDicomImageBoxInfo(id)){
+    (info as DicomImageBoxInfo).currentSeriesNumber = idx;
+    (info as DicomImageBoxInfo).currentSliceNumber = 0;
+    (info as DicomImageBoxInfo).description = seriesSummaries.value[idx]?.description ?? "";
+  } else {
+    // Volume 表示中: 該当シリーズが volume を持たないなら生成
+    if (!seriesList[idx].volume && seriesList[idx].myDicom){
+      mpr_(idx);
+    }
+    if (seriesList[idx].volume){
+      const v = seriesList[idx].volume!;
+      const p0 = voxelToWorld_(new THREE.Vector3(0,0,0), idx);
+      const p1 = voxelToWorld_(new THREE.Vector3(v.nx, v.ny, v.nz), idx);
+      const center = p0.add(p1).divideScalar(2);
+      imageBoxInfos.value[id] = {
+        clut: (info as VolumeImageBoxInfo).clut ?? 0,
+        myWC: info.myWC ?? null,
+        myWW: info.myWW ?? null,
+        description: seriesSummaries.value[idx]?.description ?? "",
+        currentSeriesNumber: idx,
+        centerInWorld: center,
+        vecx: v.vectorX.clone(),
+        vecy: v.vectorY.clone(),
+        vecz: v.vectorZ.clone(),
+        isMip: false,
+        mip: null,
+      } as VolumeImageBoxInfo;
+    }
+  }
+  show();
+};
 
 const doSort = () => {
   let serieses:string[] = [];
@@ -352,6 +851,9 @@ const doSort = () => {
       });
     }
   }
+
+  detectPetCtFromDicom();
+  rebuildSeriesSummaries();
 
   summaryText.value = "";
   // for (let i=0; i<serieses.length; i++){
@@ -530,12 +1032,18 @@ const showImage = (i:number) => {
     const clut = cluts[info.clut];
 
     if (!info.isMip){
-        imb.value![i].drawNiftiSlice(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,clut);
+        imb.value![i].drawNiftiSlice(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,clut, buildMaskOverlayForBox(i));
       }else{
       const angle = info.mip!.mipAngle;
+      // MIP の対象 volume が PET と一致する場合のみマスク overlay を渡す
+      // （マスクは PET 格子と同形なので、同じ pix と同じ index で参照可能）
+      const petIdx = findPetSeriesIndex();
+      const overlayForMip = (info.currentSeriesNumber === petIdx)
+        ? buildMipMaskOverlay()
+        : undefined;
       imb.value![i].drawNiftiMip(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,
         angle, info.mip!.thresholdSurfaceMip, info.mip!.depthSurfaceMip, clut,
-        info.mip!.isSurface);
+        info.mip!.isSurface, overlayForMip);
       }
   }else{ // fusion
     const info = info1 as FusedVolumeImageBoxInfo;
@@ -573,8 +1081,55 @@ const showImage = (i:number) => {
     imb.value![i].drawNiftiSliceFusion(
       pixelData0, nx0,ny0,nz0, wc0!, ww0!, p00_0,v01_0,v10_0,clut0,
       pixelData1, nx1,ny1,nz1, wc1!, ww1!, p00_1,v01_1,v10_1,clut1,
+      buildMaskOverlayForBox(i),
     );
 
+  }
+
+  drawAnnotationOverlays(i);
+};
+
+const drawAnnotationOverlays = (i: number) => {
+  if (!isVolumeImageBoxInfo(i)) return;
+  const a = getVolumeImageBoxInfo(i);
+
+  // 球: 現スライス面と球の交差円を描く。
+  const s = segStore.sphere;
+  if (s){
+    const c = s.centerWorld;
+    const planeOrigin = a.centerInWorld;
+    const normal = a.vecz.clone().normalize();
+    const d = (c.x - planeOrigin.x) * normal.x + (c.y - planeOrigin.y) * normal.y + (c.z - planeOrigin.z) * normal.z;
+    if (Math.abs(d) <= s.radiusMm){
+      const rIntersect = Math.sqrt(s.radiusMm * s.radiusMm - d * d);
+      // 中心を screen 座標へ。screenToWorld の逆: vecx, vecy で展開しているので、(x,y)→ world のうち (x,y) を解く。
+      const dxw = c.x - planeOrigin.x - d * normal.x;
+      const dyw = c.y - planeOrigin.y - d * normal.y;
+      const dzw = c.z - planeOrigin.z - d * normal.z;
+      // dx*vecx + dy*vecy = (dxw,dyw,dzw) を最小二乗で。vecx,vecy は直交とは限らないが大体直交。
+      const ax = a.vecx, ay = a.vecy;
+      const a11 = ax.x*ax.x + ax.y*ax.y + ax.z*ax.z;
+      const a22 = ay.x*ay.x + ay.y*ay.y + ay.z*ay.z;
+      const a12 = ax.x*ay.x + ax.y*ay.y + ax.z*ay.z;
+      const b1 = ax.x*dxw + ax.y*dyw + ax.z*dzw;
+      const b2 = ay.x*dxw + ay.y*dyw + ay.z*dzw;
+      const det = a11*a22 - a12*a12;
+      if (Math.abs(det) > 1e-12){
+        const u = (a22*b1 - a12*b2) / det;
+        const v = (a11*b2 - a12*b1) / det;
+        const cx = u + imageBoxW.value!/2;
+        const cy = v + imageBoxH.value!/2;
+        const pixPerMm = 1 / Math.sqrt(a11);
+        const rPx = rIntersect * pixPerMm;
+        imb.value![i].drawSphereOverlay(cx, cy, rPx);
+      }
+    }
+  }
+
+  // polygon: 描画中のものをオーバーレイ。
+  const p = segStore.polygon;
+  if (p && p.imageBoxId === i && p.screenVertices.length > 0){
+    imb.value![i].drawPolygonOverlay(p.screenVertices, p.mode, !p.inProgress);
   }
 };
 
@@ -607,9 +1162,218 @@ const changeSuv = (a:number,b:number, doShow: boolean) => {
   }
 }
 
+const findPetSeriesIndex = (): number => {
+  const ref = segStore.petVolumeRef;
+  if (!ref) return -1;
+  // Pinia は state を Proxy 化するので === では一致しない。voxel TypedArray の同一性で照合。
+  for (let i = 0; i < seriesList.length; i++) {
+    const v = seriesList[i].volume;
+    if (!v) continue;
+    if (v.voxel === ref.voxel) return i;
+    if (v === ref) return i;
+    if (v.metadata?.seriesUID && ref.metadata?.seriesUID && v.metadata.seriesUID === ref.metadata.seriesUID) return i;
+  }
+  // フォールバック: modality === 'PT' のシリーズを返す
+  for (let i = 0; i < seriesList.length; i++) {
+    const v = seriesList[i].volume;
+    if (v?.metadata?.modality === 'PT') return i;
+  }
+  return -1;
+};
+
+// MIP 用のマスクオーバレイ。drawNiftiMip では mask の (nx,ny,nz) が
+// pix と一致している前提で、内部で投影マップを生成する。
+// p00/v01/v10 は drawNiftiMip 側では使われない（投影後の 2D 配列で参照）が、
+// 型を満たすためにダミーで渡す。
+const buildMipMaskOverlay = () => {
+  if (!segStore.overlayEnabled) return undefined;
+  const mask = segStore.finalMask;
+  const pet = segStore.petVolumeRef;
+  if (!mask || !pet) return undefined;
+  return {
+    mask,
+    p00: new THREE.Vector3(0,0,0),
+    v01: new THREE.Vector3(0,0,0),
+    v10: new THREE.Vector3(0,0,0),
+    nx: pet.nx, ny: pet.ny, nz: pet.nz,
+    labelClut,
+    alpha: segStore.overlayAlpha,
+  };
+};
+
+const buildMaskOverlayForBox = (i: number) => {
+  if (!segStore.overlayEnabled) return undefined;
+  const mask = segStore.finalMask;
+  const pet = segStore.petVolumeRef;
+  if (!mask || !pet) return undefined;
+  const petIdx = findPetSeriesIndex();
+  if (petIdx < 0) return undefined;
+
+  const p00 = worldToVoxel_(screenToWorld(i, 0, 0), petIdx);
+  const v01 = worldToVoxel_(screenToWorld(i, 0, 1), petIdx).sub(p00);
+  const v10 = worldToVoxel_(screenToWorld(i, 1, 0), petIdx).sub(p00);
+
+  return {
+    mask,
+    p00, v01, v10,
+    nx: pet.nx, ny: pet.ny, nz: pet.nz,
+    labelClut,
+    alpha: segStore.overlayAlpha,
+  };
+};
+
+// 中央スライスから 96x96 のサムネイルを作る。
+// volume があれば voxel から、なければ DICOM 中央スライスから生成。
+const generateThumbnail = (s: SeriesList, modality: string): string | null => {
+  const TH = 96;
+  const cv = document.createElement('canvas');
+  cv.width = TH; cv.height = TH;
+  const ctx = cv.getContext('2d');
+  if (!ctx) return null;
+  const img = ctx.getImageData(0, 0, TH, TH);
+
+  // WC/WW のデフォルト
+  const isPet = modality === 'PT' || modality === 'PET';
+  const defaultWC = isPet ? 3 : 40;
+  const defaultWW = isPet ? 6 : 400;
+
+  if (s.volume){
+    const v = s.volume;
+    const k = Math.floor(v.nz / 2);
+    const wc = defaultWC, ww = defaultWW;
+    let ad = 0;
+    for (let y = 0; y < TH; y++){
+      for (let x = 0; x < TH; x++){
+        const px = Math.floor(x / TH * v.nx);
+        const py = Math.floor(y / TH * v.ny);
+        const raw = v.voxel[k * v.nx * v.ny + py * v.nx + px];
+        let p = Math.floor((raw - (wc - ww/2)) * (255/ww));
+        if (p < 0) p = 0; if (p > 255) p = 255;
+        img.data[ad] = p;
+        img.data[ad+1] = p;
+        img.data[ad+2] = p;
+        img.data[ad+3] = 255;
+        ad += 4;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    return cv.toDataURL('image/png');
+  }
+  if (s.myDicom && s.myDicom.length > 0){
+    try {
+      const k = Math.floor(s.myDicom.length / 2);
+      const ds = s.myDicom[k];
+      const rows = ds.int16("x00280010") ?? 512;
+      const cols = ds.int16("x00280011") ?? 512;
+      const intercept = Number(ds.string("x00281052") ?? "0");
+      const slope = Number(ds.string("x00281053") ?? "1");
+      const wc = Number(ds.string("x00281050", 0) ?? defaultWC);
+      const ww = Number(ds.string("x00281051", 0) ?? defaultWW);
+      const pde = ds.elements.x7fe00010;
+      if (!pde) return null;
+      // 圧縮系（jpeg lossless 等）はサムネ生成パスでは扱わない
+      if (DecompressJpegLossless.check(ds)) return null;
+      const i16 = new Int16Array(ds.byteArray.buffer, pde.dataOffset, pde.length / 2);
+      let ad = 0;
+      for (let y = 0; y < TH; y++){
+        for (let x = 0; x < TH; x++){
+          const px = Math.floor(x / TH * cols);
+          const py = Math.floor(y / TH * rows);
+          const raw = i16[py * cols + px] * slope + intercept;
+          let p = Math.floor((raw - (wc - ww/2)) * (255/ww));
+          if (p < 0) p = 0; if (p > 255) p = 255;
+          img.data[ad] = p;
+          img.data[ad+1] = p;
+          img.data[ad+2] = p;
+          img.data[ad+3] = 255;
+          ad += 4;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+      return cv.toDataURL('image/png');
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+const rebuildSeriesSummaries = () => {
+  const out: SeriesSummary[] = [];
+  for (let i = 0; i < seriesList.length; i++){
+    const s = seriesList[i];
+    let description = '', modality = '-', matrixSize = '-', voxelSize = '-', fileCount = 0;
+    if (s.myDicom && s.myDicom.length > 0){
+      const ds = s.myDicom[0];
+      description = ds.string("x0008103e") ?? '';
+      modality = (ds.string("x00080060") ?? '').toUpperCase();
+      const rows = ds.int16("x00280010") ?? 0;
+      const cols = ds.int16("x00280011") ?? 0;
+      matrixSize = `${rows}×${cols}×${s.myDicom.length}`;
+      const px = ds.floatString("x00280030", 0);
+      const py = ds.floatString("x00280030", 1);
+      if (px != null && py != null){
+        voxelSize = `${px.toFixed(2)}×${py.toFixed(2)} mm`;
+      }
+      fileCount = s.myDicom.length;
+    }
+    if (s.volume){
+      const v = s.volume;
+      modality = v.metadata?.modality ?? modality;
+      description = v.metadata?.seriesDescription ?? description;
+      matrixSize = `${v.nx}×${v.ny}×${v.nz}`;
+      voxelSize = `${v.vectorX.length().toFixed(2)}×${v.vectorY.length().toFixed(2)}×${v.vectorZ.length().toFixed(2)} mm`;
+    }
+    if (!description) description = `Series ${i}`;
+    out.push({
+      index: i,
+      description,
+      modality: modality || '-',
+      matrixSize,
+      voxelSize,
+      fileCount,
+      hasVolume: !!s.volume,
+      thumbnail: generateThumbnail(s, modality),
+    });
+  }
+  seriesSummaries.value = out;
+}
+
+const detectPetCtFromDicom = () => {
+  // DICOM ファイル群から PET/CT modality を検出して store に登録。
+  // volume が未生成のシリーズは modality タグだけでも検出して候補として扱う。
+  let petIdx = -1, ctIdx = -1;
+  for (let i = 0; i < seriesList.length; i++) {
+    const dlist = seriesList[i].myDicom;
+    if (!dlist || dlist.length === 0) continue;
+    const m = (dlist[0].string("x00080060") ?? "").toUpperCase();
+    if ((m === "PT" || m === "PET") && petIdx < 0) petIdx = i;
+    if (m === "CT" && ctIdx < 0) ctIdx = i;
+  }
+  segStore.setPetVolume(petIdx >= 0 ? (seriesList[petIdx].volume ?? null) : null);
+  segStore.setCtVolume(ctIdx >= 0 ? (seriesList[ctIdx].volume ?? null) : null);
+};
+
+const refreshSegStoreVolumeRefs = () => {
+  // mpr_ 後など、volume が新規生成されたタイミングで store の参照を更新。
+  for (let i = 0; i < seriesList.length; i++) {
+    const v = seriesList[i].volume;
+    if (!v) continue;
+    const m = v.metadata?.modality;
+    if (m === "PT" && segStore.petVolumeRef !== v) {
+      segStore.setPetVolume(v);
+    }
+    if (m === "CT" && segStore.ctVolumeRef !== v) {
+      segStore.setCtVolume(v);
+    }
+  }
+};
+
 const mpr_ = (i: number) => {
   const d = generateVolumeFromDicom(seriesList[i].myDicom!);
   seriesList[i].volume = d;
+  refreshSegStoreVolumeRefs();
+  rebuildSeriesSummaries();
 
   const p0 = voxelToWorld_(new THREE.Vector3(0,0,0),i);
   const p1 = voxelToWorld_(new THREE.Vector3(d.nx,d.ny, d.nz),i);
@@ -812,69 +1576,381 @@ const maximize = () => {
   imageBoxW.value=hello!.scrollWidth! / 2 - 10;
 }
 
+const gridCols = (n: number) => {
+  if (n <= 1) return 1;
+  if (n <= 2) return 2;
+  if (n <= 4) return 2;
+  if (n <= 6) return 3;
+  if (n <= 9) return 3;
+  return 4;
+};
+const gridStyle = computed(() => {
+  const cols = gridCols(tileN.value ?? 1);
+  return { gridTemplateColumns: `repeat(${cols}, max-content)` };
+});
 
+// 画像エリアのサイズから 2x2 がちょうど収まる正方形サイズを算出。
+// drawer (sidebar) 開閉、app-bar高さ、余白を差し引く。
+const computeFitBoxSize = (cols: number, rows: number) => {
+  const sidebarW = drawer.value ? 280 : 0;
+  const inspectorW = inspector.value ? 320 : 0;
+  const appBarH = 48;
+  const gap = 6 * (Math.max(cols, rows) - 1);
+  const padding = 16;
+  const availW = Math.max(200, window.innerWidth - sidebarW - inspectorW - padding);
+  const availH = Math.max(200, window.innerHeight - appBarH - padding);
+  const w = Math.floor((availW - gap) / cols);
+  const h = Math.floor((availH - gap) / rows);
+  return Math.max(150, Math.min(w, h));
+}
+
+// 現在の tileN と drawer 状態から最適な box サイズを返す
+const fitBoxSizeForCurrentTile = () => {
+  const n = tileN.value ?? 1;
+  const cols = gridCols(n);
+  const rows = Math.ceil(n / cols);
+  return computeFitBoxSize(cols, rows);
+}
+
+// PET 標準ビュー: 2x2 で
+//   Box 0 = CT axial
+//   Box 1 = PET axial
+//   Box 2 = Fusion axial
+//   Box 3 = PET MIP
+const setupPetStandardView = async () => {
+  // PET/CT のシリーズインデックスを抽出
+  let petIdx = -1, ctIdx = -1;
+  for (let i = 0; i < seriesList.length; i++) {
+    const dlist = seriesList[i].myDicom;
+    if (!dlist || dlist.length === 0) continue;
+    const m = (dlist[0].string("x00080060") ?? "").toUpperCase();
+    if ((m === "PT" || m === "PET") && petIdx < 0) petIdx = i;
+    if (m === "CT" && ctIdx < 0) ctIdx = i;
+  }
+  if (petIdx < 0 || ctIdx < 0){
+    console.warn("PET/CT 両方が必要です。petIdx=", petIdx, " ctIdx=", ctIdx);
+    return;
+  }
+
+  // PET と CT を Volume 化（未生成なら）
+  if (!seriesList[petIdx].volume) mpr_(petIdx);
+  if (!seriesList[ctIdx].volume) mpr_(ctIdx);
+  const pet = seriesList[petIdx].volume!;
+  const ct  = seriesList[ctIdx].volume!;
+
+  // 各 Box の中心は CT の中心を基準に揃える（同じ世界座標を表示）
+  const ctCenter = (() => {
+    const p0 = voxelToWorld_(new THREE.Vector3(0,0,0), ctIdx);
+    const p1 = voxelToWorld_(new THREE.Vector3(ct.nx, ct.ny, ct.nz), ctIdx);
+    return p0.add(p1).divideScalar(2);
+  })();
+  const petCenter = (() => {
+    const p0 = voxelToWorld_(new THREE.Vector3(0,0,0), petIdx);
+    const p1 = voxelToWorld_(new THREE.Vector3(pet.nx, pet.ny, pet.nz), petIdx);
+    return p0.add(p1).divideScalar(2);
+  })();
+
+  // CT axial: black2white
+  imageBoxInfos.value[0] = {
+    clut: 0, myWC: 40, myWW: 400, description: "CT axial",
+    currentSeriesNumber: ctIdx,
+    centerInWorld: ctCenter.clone(),
+    vecx: ct.vectorX.clone(),
+    vecy: ct.vectorY.clone(),
+    vecz: ct.vectorZ.clone(),
+    isMip: false, mip: null,
+  } as VolumeImageBoxInfo;
+
+  // PET axial: white2black (0=white, high count=black)
+  imageBoxInfos.value[1] = {
+    clut: 1, myWC: 3, myWW: 6, description: "PET axial",
+    currentSeriesNumber: petIdx,
+    centerInWorld: petCenter.clone(),
+    vecx: pet.vectorX.clone(),
+    vecy: pet.vectorY.clone(),
+    vecz: pet.vectorZ.clone(),
+    isMip: false, mip: null,
+  } as VolumeImageBoxInfo;
+
+  // Fusion axial: CT (black2white) + PET (rainbow)
+  imageBoxInfos.value[2] = {
+    centerInWorld: ctCenter.clone(),
+    vecx: ct.vectorX.clone(),
+    vecy: ct.vectorY.clone(),
+    vecz: ct.vectorZ.clone(),
+    clut: 0,    // black2white (CT そのまま)
+    clut1: 2,   // rainbow (PET)
+    currentSeriesNumber: ctIdx,
+    currentSeriesNumber1: petIdx,
+    description: "Fusion axial",
+    myWC: 40,  myWW: 400,
+    myWC1: 3,  myWW1: 6,
+  } as FusedVolumeImageBoxInfo;
+
+  // PET MIP: white2black
+  imageBoxInfos.value[3] = {
+    clut: 1,
+    myWC: 3, myWW: 6,
+    description: "PET MIP",
+    currentSeriesNumber: petIdx,
+    centerInWorld: petCenter.clone(),
+    vecx: pet.vectorX.clone(),
+    vecy: pet.vectorZ.clone().normalize().multiplyScalar(pet.vectorX.length()),
+    vecz: pet.vectorY.clone(),
+    isMip: true,
+    mip: { mipAngle: 0, isSurface: false, thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 },
+  } as VolumeImageBoxInfo;
+
+  // store の参照を更新
+  refreshSegStoreVolumeRefs();
+
+  // 1画面に2x2が収まるサイズに自動調整
+  autoFitMode.value = true;
+  applyAutoFit();
+
+  // ImageBox 再 init してから描画
+  await nextTick();
+  if (imb.value){
+    for (const a of imb.value){ a.init(); }
+  }
+  show();
+}
+
+// ===== テスト DICOM 自動オープン =====
+// Chromium 系: showDirectoryPicker() を使い、選んだフォルダのハンドルをセッション中キャッシュ。
+// 一度選べば「Load test DICOM」ボタンで即時再ロード可能。
+let cachedTestDirHandle: any = null;
+
+const collectFilesFromDirHandle = async (dirHandle: any): Promise<File[]> => {
+  const out: File[] = [];
+  const walk = async (h: any) => {
+    for await (const entry of h.values()){
+      if (entry.kind === 'file'){
+        try { out.push(await entry.getFile()); } catch {}
+      } else if (entry.kind === 'directory'){
+        await walk(entry);
+      }
+    }
+  };
+  await walk(dirHandle);
+  return out;
+};
+
+const loadTestDicom = async () => {
+  const w = window as any;
+  if (typeof w.showDirectoryPicker !== 'function'){
+    alert('このブラウザは File System Access API 非対応です。Chrome/Edge を使ってください。');
+    return;
+  }
+  try {
+    if (!cachedTestDirHandle){
+      cachedTestDirHandle = await w.showDirectoryPicker();
+    }
+    isLoading.value = true;
+    const files = await collectFilesFromDirHandle(cachedTestDirHandle);
+    if (files.length === 0){
+      alert('フォルダにファイルが見つかりません。');
+      isLoading.value = false;
+      return;
+    }
+    // ロード完了 → 自動で PET Standard へ。loadFiles は非同期（FileReader ベース）なので
+    // doSort 完了を待ってから setupPetStandardView を実行する。
+    // loadFiles の poll callback が isLoading を false にするので、それを watch で検知。
+    const stopWatch = watch(isLoading, async (v) => {
+      if (v === false){
+        stopWatch();
+        await nextTick();
+        // PET/CT が揃っていれば自動で標準ビューへ
+        const list = seriesSummaries.value;
+        const hasPt = list.some(s => s.modality === 'PT' || s.modality === 'PET');
+        const hasCt = list.some(s => s.modality === 'CT');
+        if (hasPt && hasCt){
+          tileN.value = 4;
+          await nextTick();
+          await setupPetStandardView();
+        }
+      }
+    });
+    loadFiles(files);
+  } catch (err){
+    console.warn('loadTestDicom canceled or failed', err);
+    isLoading.value = false;
+  }
+};
+
+const disableAutoFit = () => { autoFitMode.value = false; };
+const fitToWindow = () => {
+  autoFitMode.value = true;
+  applyAutoFit();
+};
+
+defineExpose({
+  setupPetStandardView,
+  loadTestDicom,
+  disableAutoFit,
+  fitToWindow,
+  seriesSummariesPublic: seriesSummaries,
+});
 
 </script>
 
 <template>
-  <v-container fluid>
-    <v-row>
-      <v-navigation-drawer v-model="drawer" style="background-color: #000;">
-        <v-container>
-          <sidebar @fileLoaded="loadFile"
-            @dirLoaded="loadFiles"
-            @sort="doSort"
-            @leftButtonFunctionChanged="leftButtonFunctionChanged"
-            @presetSelected="presetSelected"
-            @changeSlice="changeSlice_"
-            @changeSeries="changeSeries"
-            @mpr="mpr(true)"
-            @axi="switchToAxial(true)"
-            @cor="switchToCoronal(true)"
-            @mip="switchToMip(true)"
-            @smip="switchToSMip(true)"
-            @monochrome="switchToMonochrome"
-            @rainbow="switchToRainbow"
-            @hot="switchToHot"
-            @reverse="reverse"
-            @phantom1="phantom1"
-            @phantom2="phantom2"
-            @phantom3="phantom3"
-            @fusion="fusion"
-            @maximize="maximize"
-          ></sidebar>
-        
+  <!-- Left sidebar: navigation / IO / view / series -->
+  <v-navigation-drawer
+    v-model="drawer"
+    width="280"
+    class="mv-pane"
+    :border="0"
+  >
+    <sidebar
+      :series-summaries="seriesSummaries"
+      @fileLoaded="loadFile"
+      @dirLoaded="loadFiles"
+      @sort="doSort"
+      @leftButtonFunctionChanged="leftButtonFunctionChanged"
+      @presetSelected="presetSelected"
+      @changeSlice="changeSlice_"
+      @changeSeries="changeSeries"
+      @selectSeries="onSelectSeriesFromCard"
+      @mpr="mpr(true)"
+      @axi="switchToAxial(true)"
+      @cor="switchToCoronal(true)"
+      @mip="switchToMip(true)"
+      @smip="switchToSMip(true)"
+      @monochrome="switchToMonochrome(true)"
+      @rainbow="switchToRainbow(true)"
+      @hot="switchToHot(true)"
+      @reverse="reverse(true)"
+      @phantom1="phantom1"
+      @phantom2="phantom2"
+      @phantom3="phantom3"
+      @fusion="fusion"
+      @maximize="maximize"
+      @redraw="show"
+    />
+  </v-navigation-drawer>
 
-      </v-container>
-        
-      </v-navigation-drawer>
+  <!-- Right inspector: segmentation -->
+  <v-navigation-drawer
+    v-model="inspector"
+    width="320"
+    location="right"
+    class="mv-pane"
+    :border="0"
+  >
+    <div class="mv-inspector-header">
+      <span class="mv-section-title">Segmentation</span>
+      <v-spacer />
+      <v-btn
+        icon="mdi-close"
+        size="x-small"
+        variant="text"
+        @click="inspector = false"
+      />
+    </div>
+    <SegmentationPanel @redraw="show" />
+  </v-navigation-drawer>
 
-      <v-col>
-        <v-row no-gutters id="hello">
-          <v-col cols="auto" v-for="i in tileN" >
-            <imagebox :class="{'cursor-grab': leftButtonFunction==='pan'}" ref="imb" :imageBoxId="i-1"
-             :width="imageBoxW" :height="imageBoxH" @wheel.prevent="wheel"
-              @click="imageBoxClicked" @mousemove="mouseMove"
-              @dragenter="dragEnter" @dragleave="dragLeave" @dropover.prevent @drop.prevent="dropFile"
-              :isEnter="isEnter" :selected="i-1 === selectedImageBoxId">
-            </imagebox>
-          </v-col>
-        </v-row>
+  <!-- Image area -->
+  <div class="mv-imagearea" id="hello">
+    <div class="mv-tile-grid" :style="gridStyle">
+      <imagebox
+        v-for="i in tileN"
+        :key="i"
+        :class="['mv-imagebox-cell', { 'is-selected': i-1 === selectedImageBoxId, 'cursor-grab': leftButtonFunction==='pan' }]"
+        ref="imb"
+        :imageBoxId="i-1"
+        :width="imageBoxW"
+        :height="imageBoxH"
+        @wheel.prevent="wheel"
+        @click="imageBoxClicked"
+        @mousemove="mouseMove"
+        @mouseleave="debugShow = false"
+        @mousedown.middle.prevent
+        @auxclick.prevent
+        @contextmenu="onContextMenu"
+        @dblclick="onDblClick"
+        @dragenter="dragEnter"
+        @dragleave="dragLeave"
+        @dropover.prevent
+        @drop.prevent="dropFile"
+        :isEnter="isEnter"
+        :selected="i-1 === selectedImageBoxId"
+      />
+    </div>
 
-        <v-row>
-          <textarea v-if="showSummary" v-model="summaryText" style="height: auto;" />
-        </v-row>
+    <textarea v-if="showSummary" v-model="summaryText" style="height: auto;" />
+    <textarea v-if="showTag" v-model="tagText" style="height: 400px;" />
 
-        <v-row>
-          <textarea v-if="showTag" v-model="tagText" style="height: 400px;" />
-        </v-row>
+    <!-- Debug: voxel hover inspector -->
+    <DebugInspector
+      :enabled="debugMode"
+      :rows="debugHoverRows"
+      :screen-x="debugScreenX"
+      :screen-y="debugScreenY"
+      :show="debugShow"
+    />
 
-      </v-col>
-
-  </v-row>
-
-</v-container>
-
+    <!-- Debug: indicator badge (画面右下) -->
+    <div v-if="debugMode" class="mv-debug-badge">
+      <v-icon icon="mdi-bug" size="x-small" />
+      DEBUG
+      <span class="hint">Shift+Click=edit voxel / Ctrl+Shift+D=toggle</span>
+    </div>
+  </div>
 </template>
+
+<style scoped>
+.mv-tile-grid {
+  display: grid;
+  gap: 6px;
+  justify-content: center;
+  align-content: start;
+  margin: auto;
+}
+
+.mv-inspector-header {
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--mv-border);
+  position: sticky;
+  top: 0;
+  background: var(--mv-surface);
+  z-index: 1;
+}
+
+/* drawer 内のテキストが上端で見切れないよう */
+:deep(.v-navigation-drawer__content) {
+  padding-top: 0;
+}
+
+.mv-debug-badge {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 9998;
+  background: rgba(255, 92, 122, 0.18);
+  border: 1px solid var(--mv-error);
+  color: var(--mv-error);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 4px 8px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  pointer-events: none;
+}
+.mv-debug-badge .hint {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--mv-text-muted);
+  margin-left: 6px;
+}
+</style>
 
 

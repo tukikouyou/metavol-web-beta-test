@@ -13,6 +13,7 @@
     "dicom-parser": "^1.8.21",
     "jpeg-lossless-decoder-js": "^2.1.2",
     "nifti-reader-js": "^0.6.8",
+    "pinia": "^3.0.4",
     "roboto-fontface": "*",
     "three": "^0.164.1",
     "vue": "^3.4.21",

@@ -7,11 +7,13 @@ export {}
 
 declare module 'vue' {
   export interface GlobalComponents {
+    DebugInspector: typeof import('./src/components/DebugInspector.vue')['default']
     DicomView: typeof import('./src/components/DicomView.vue')['default']
     HelloWorld: typeof import('./src/components/HelloWorld.vue')['default']
     ImageBox: typeof import('./src/components/ImageBox.vue')['default']
     NiftiView: typeof import('./src/components/NiftiView.vue')['default']
+    SegmentationPanel: typeof import('./src/components/SegmentationPanel.vue')['default']
+    SeriesList: typeof import('./src/components/SeriesList.vue')['default']
     Sidebar: typeof import('./src/components/Sidebar.vue')['default']
-    TitleBar: typeof import('./src/components/TitleBar.vue')['default']
   }
 }
