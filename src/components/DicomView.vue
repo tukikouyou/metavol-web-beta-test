@@ -236,7 +236,7 @@ const handleDebugEditClick = (boxId: number, e: MouseEvent) => {
   let chosenIdx = candidates[0].idx;
   if (candidates.length > 1){
     const list = candidates.map((c, n) => `${n}: ${c.descr}`).join('\n');
-    const resp = prompt(`Edit which series?\n${list}\n\n番号を入力（0..${candidates.length-1}）:`, '0');
+    const resp = prompt(`Edit which series?\n${list}\n\nEnter index (0..${candidates.length-1}):`, '0');
     if (resp == null) return true;
     const n = Number(resp);
     if (!Number.isFinite(n) || n < 0 || n >= candidates.length) return true;
@@ -248,7 +248,7 @@ const handleDebugEditClick = (boxId: number, e: MouseEvent) => {
   const i = Math.floor(vox.x), j = Math.floor(vox.y), k = Math.floor(vox.z);
   const idx = k * target.nx * target.ny + j * target.nx + i;
   const cur = target.voxel[idx];
-  const resp = prompt(`Edit voxel value\n  series ${chosenIdx} (${target.metadata?.modality ?? '-'}) at (${i},${j},${k})\n  current: ${cur}\n\n新しい値:`, String(cur));
+  const resp = prompt(`Edit voxel value\n  series ${chosenIdx} (${target.metadata?.modality ?? '-'}) at (${i},${j},${k})\n  current: ${cur}\n\nNew value:`, String(cur));
   if (resp == null) return true;
   const newVal = Number(resp);
   if (!Number.isFinite(newVal)){
@@ -1078,10 +1078,11 @@ const showImage = (i:number) => {
     const clut0 = cluts[info.clut];
     const clut1 = cluts[info.clut1];
 
+    // Fusion view ではマスク overlay を描かない（要望により）。
     imb.value![i].drawNiftiSliceFusion(
       pixelData0, nx0,ny0,nz0, wc0!, ww0!, p00_0,v01_0,v10_0,clut0,
       pixelData1, nx1,ny1,nz1, wc1!, ww1!, p00_1,v01_1,v10_1,clut1,
-      buildMaskOverlayForBox(i),
+      undefined,
     );
 
   }
@@ -1628,7 +1629,7 @@ const setupPetStandardView = async () => {
     if (m === "CT" && ctIdx < 0) ctIdx = i;
   }
   if (petIdx < 0 || ctIdx < 0){
-    console.warn("PET/CT 両方が必要です。petIdx=", petIdx, " ctIdx=", ctIdx);
+    console.warn("Both PET and CT are required. petIdx=", petIdx, " ctIdx=", ctIdx);
     return;
   }
 
@@ -1739,7 +1740,7 @@ const collectFilesFromDirHandle = async (dirHandle: any): Promise<File[]> => {
 const loadTestDicom = async () => {
   const w = window as any;
   if (typeof w.showDirectoryPicker !== 'function'){
-    alert('このブラウザは File System Access API 非対応です。Chrome/Edge を使ってください。');
+    alert('This browser does not support the File System Access API. Please use Chrome or Edge.');
     return;
   }
   try {
@@ -1749,7 +1750,7 @@ const loadTestDicom = async () => {
     isLoading.value = true;
     const files = await collectFilesFromDirHandle(cachedTestDirHandle);
     if (files.length === 0){
-      alert('フォルダにファイルが見つかりません。');
+      alert('No files found in the selected folder.');
       isLoading.value = false;
       return;
     }

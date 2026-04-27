@@ -42,7 +42,7 @@
         <v-icon icon="mdi-folder-open-outline" />
         <span class="mv-tool-label">Test</span>
         <v-tooltip activator="parent" location="bottom">
-          フォルダを選択してテスト DICOM を読み込む（同セッション中は再選択不要）
+          Pick a folder to load test DICOM (no re-pick needed within the same session)
         </v-tooltip>
       </v-btn>
 
@@ -56,7 +56,7 @@
         <v-icon icon="mdi-view-grid" class="mr-1" size="small" />
         PET Standard
         <v-tooltip activator="parent" location="bottom">
-          {{ petCtReady ? '2x2: CT axi / PET axi / Fusion axi / PET MIP' : 'PET と CT の両方をロードしてください' }}
+          {{ petCtReady ? '2x2: CT axi / PET axi / Fusion axi / PET MIP' : 'Load both PET and CT first' }}
         </v-tooltip>
       </v-btn>
 

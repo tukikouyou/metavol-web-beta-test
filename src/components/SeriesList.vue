@@ -27,7 +27,7 @@ const modalityChip = (m: string): { color: string; text: string } => {
 <template>
     <v-container fluid class="pa-1">
         <div v-if="series.length === 0" class="text-caption text-disabled px-2">
-            シリーズなし
+            No series
         </div>
         <div
             v-for="s in series"

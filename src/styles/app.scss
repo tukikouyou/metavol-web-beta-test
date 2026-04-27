@@ -31,8 +31,13 @@ html, body, #app {
 }
 
 .v-main {
+  // Vuetify が --v-layout-top/-left/-right で計算する余白をそのまま使う。
+  // 以前は `padding: 0 !important` で潰してしまい、app-bar が画像領域に被っていた。
   --v-layout-top: 48px !important; // app-bar 高さに合わせる
-  padding: 0 !important;
+  padding-top: var(--v-layout-top) !important;
+  padding-right: var(--v-layout-right) !important;
+  padding-bottom: var(--v-layout-bottom) !important;
+  padding-left: var(--v-layout-left) !important;
 }
 .v-main__wrap {
   padding: 0 !important;

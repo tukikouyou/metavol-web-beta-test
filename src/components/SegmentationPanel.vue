@@ -42,6 +42,63 @@ const labelRows = computed(() => {
     }));
 });
 
+// 現在ラベルの PET 値ヒストグラム。
+// finalMask 全 voxel をスキャン (maskVersion 依存) → label に該当する voxel の PET 値を bin 集計。
+const HIST_BINS = 30;
+const labelHistogram = computed(() => {
+    void store.maskVersion; // reactivity 依存
+    const id = store.currentLabelId;
+    const pet = store.petVolumeRef;
+    const mask = store.finalMask;
+    if (!pet || !mask) return null;
+    const pix = pet.voxel;
+
+    let mn = Infinity, mx = -Infinity, sum = 0, sumSq = 0, n = 0;
+    for (let i = 0; i < mask.length; i++) {
+        if (mask[i] !== id) continue;
+        const v = pix[i];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        sum += v;
+        sumSq += v * v;
+        n++;
+    }
+    if (n === 0) {
+        return { count: 0, min: 0, max: 0, mean: 0, std: 0, counts: [] as number[], lo: 0, hi: 0, binWidth: 0, peak: 0 };
+    }
+    const mean = sum / n;
+    const variance = Math.max(0, sumSq / n - mean * mean);
+    const std = Math.sqrt(variance);
+
+    const lo = 0;
+    const hi = mx > lo ? mx : lo + 1;
+    const binWidth = (hi - lo) / HIST_BINS;
+    const counts = new Array<number>(HIST_BINS).fill(0);
+    for (let i = 0; i < mask.length; i++) {
+        if (mask[i] !== id) continue;
+        const v = pix[i];
+        let bi = Math.floor((v - lo) / binWidth);
+        if (bi < 0) bi = 0;
+        if (bi >= HIST_BINS) bi = HIST_BINS - 1;
+        counts[bi]++;
+    }
+    let peak = 0;
+    for (const c of counts) if (c > peak) peak = c;
+
+    return { count: n, min: mn, max: mx, mean, std, counts, lo, hi, binWidth, peak };
+});
+
+const currentLabel = computed(() => store.labelById(store.currentLabelId));
+const currentLabelColorCss = computed(() => {
+    const l = currentLabel.value;
+    if (!l) return 'var(--mv-accent)';
+    return `rgb(${l.color[0]},${l.color[1]},${l.color[2]})`;
+});
+
+// SVG 表示領域
+const HIST_VB_W = 220;
+const HIST_VB_H = 60;
+
 const onApplyThreshold = () => {
     store.applyThreshold(store.threshold);
     store.findIslands();
@@ -106,7 +163,7 @@ const polygonModeProxy = computed({
     <div class="mv-seg-panel">
         <div v-if="!petAvailable" class="mv-empty">
             <v-icon icon="mdi-information-outline" size="small" class="mr-1" />
-            PET ボリュームをロードして MPR/Fusion 表示にしてください
+            Load a PET volume and switch to MPR / Fusion view
         </div>
 
         <template v-else>
@@ -194,8 +251,8 @@ const polygonModeProxy = computed({
                     </v-btn>
                 </div>
                 <div v-else class="mv-hint">
-                    Sphere ROI ツールで PET 画像をクリック<br>
-                    球内ホイールで半径変更
+                    Click on the PET image with the Sphere ROI tool<br>
+                    Wheel inside the sphere to change radius
                 </div>
             </section>
 
@@ -218,8 +275,8 @@ const polygonModeProxy = computed({
                     </v-btn>
                 </v-btn-toggle>
                 <div class="mv-hint mt-1">
-                    左クリック=頂点 / 右クリック・ダブルクリック=確定<br>
-                    Esc=取消 / Ctrl+Z=undo
+                    Left click = vertex / Right click or double click = finish<br>
+                    Esc = cancel / Ctrl+Z = undo
                 </div>
             </section>
 
@@ -262,16 +319,79 @@ const polygonModeProxy = computed({
                 </div>
             </section>
 
+            <!-- Histogram (per label) -->
+            <section class="mv-section">
+                <div class="mv-section-title">
+                    Histogram — PET ({{ store.thresholdUnit }})
+                    <span v-if="currentLabel" class="mv-hist-label-name" :style="{ color: currentLabelColorCss }">
+                        {{ currentLabel.name }}
+                    </span>
+                </div>
+
+                <template v-if="labelHistogram && labelHistogram.count > 0">
+                    <svg
+                        class="mv-hist-svg"
+                        :viewBox="`0 0 ${HIST_VB_W} ${HIST_VB_H}`"
+                        preserveAspectRatio="none"
+                    >
+                        <!-- baseline -->
+                        <line :x1="0" :y1="HIST_VB_H" :x2="HIST_VB_W" :y2="HIST_VB_H"
+                              stroke="var(--mv-border)" stroke-width="0.5" />
+                        <!-- mean line -->
+                        <line v-if="labelHistogram.binWidth > 0"
+                              :x1="((labelHistogram.mean - labelHistogram.lo) / (labelHistogram.hi - labelHistogram.lo)) * HIST_VB_W"
+                              :y1="0"
+                              :x2="((labelHistogram.mean - labelHistogram.lo) / (labelHistogram.hi - labelHistogram.lo)) * HIST_VB_W"
+                              :y2="HIST_VB_H"
+                              stroke="var(--mv-text-muted)" stroke-width="0.6" stroke-dasharray="2 2" />
+                        <!-- bars -->
+                        <rect
+                            v-for="(c, i) in labelHistogram.counts"
+                            :key="i"
+                            :x="i * (HIST_VB_W / labelHistogram.counts.length) + 0.5"
+                            :y="HIST_VB_H - (c / labelHistogram.peak) * HIST_VB_H"
+                            :width="(HIST_VB_W / labelHistogram.counts.length) - 1"
+                            :height="(c / labelHistogram.peak) * HIST_VB_H"
+                            :fill="currentLabelColorCss"
+                        />
+                    </svg>
+                    <div class="mv-hist-axis">
+                        <span class="mv-mono">{{ labelHistogram.lo.toFixed(1) }}</span>
+                        <span class="mv-mono">{{ labelHistogram.hi.toFixed(1) }}</span>
+                    </div>
+                    <div class="mv-stats mt-1">
+                        <div class="mv-stat-row">
+                            <span class="mv-stat-label">min / max</span>
+                            <span class="mv-mono">{{ labelHistogram.min.toFixed(2) }} / {{ labelHistogram.max.toFixed(2) }}</span>
+                        </div>
+                        <div class="mv-stat-row">
+                            <span class="mv-stat-label">mean</span>
+                            <span class="mv-mono">
+                                {{ labelHistogram.mean.toFixed(2) }}
+                                <span class="mv-stat-dim">± {{ labelHistogram.std.toFixed(2) }}</span>
+                            </span>
+                        </div>
+                        <div class="mv-stat-row">
+                            <span class="mv-stat-label">voxels</span>
+                            <span class="mv-mono">{{ labelHistogram.count }}</span>
+                        </div>
+                    </div>
+                </template>
+                <div v-else class="mv-hint">
+                    No voxels assigned to the current label yet
+                </div>
+            </section>
+
             <!-- Islands -->
             <section class="mv-section">
                 <div class="mv-section-title">Islands</div>
                 <div v-if="store.componentMapValid" class="mv-hint">
-                    <span class="mv-accent">{{ store.componentCount }}</span> 成分検出済 —
-                    Assign Label ツールで島をクリック
+                    <span class="mv-accent">{{ store.componentCount }}</span> components detected —
+                    click an island with the Assign Label tool
                 </div>
                 <div v-else-if="store.finalMask" class="mv-warn-text">
                     <v-icon icon="mdi-refresh" size="x-small" class="mr-1" />
-                    マスクが更新されました
+                    Mask updated — re-run Find islands
                 </div>
                 <v-btn
                     size="small"
@@ -430,5 +550,28 @@ const polygonModeProxy = computed({
 }
 .mv-add-label .v-text-field {
     flex: 1;
+}
+
+.mv-hist-svg {
+    width: 100%;
+    height: 60px;
+    background: var(--mv-bg);
+    border: 1px solid var(--mv-border);
+    border-radius: 3px;
+    display: block;
+}
+.mv-hist-axis {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 2px;
+    font-size: 10px;
+    color: var(--mv-text-muted);
+}
+.mv-hist-label-name {
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: 0;
+    margin-left: 6px;
+    font-size: 11px;
 }
 </style>
