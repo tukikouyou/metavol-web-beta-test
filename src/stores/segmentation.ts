@@ -38,14 +38,26 @@ export interface UndoEntry {
 const ERASE_SENTINEL = 0xFFFF;
 
 const DEFAULT_LABEL_PALETTE: Array<[number, number, number]> = [
-    [255, 90, 90],
-    [90, 200, 90],
-    [90, 130, 255],
-    [255, 200, 70],
-    [220, 90, 220],
-    [70, 220, 220],
-    [255, 140, 60],
-    [180, 110, 255],
+    [255, 90, 90],     // red
+    [90, 200, 90],     // green
+    [90, 130, 255],    // blue
+    [255, 200, 70],    // yellow
+    [220, 90, 220],    // magenta
+    [70, 220, 220],    // cyan
+    [255, 140, 60],    // orange
+    [180, 110, 255],   // purple
+];
+
+// 既定ラベルセット (id は 1 から連番、color は palette を循環)。
+// CLAUDE.md の UI ポリシーに従い英語表記。
+// 順序は臨床的によく使う優先度。User は自由に追加・改名・削除できる。
+const DEFAULT_LABELS: Array<{ name: string }> = [
+    { name: 'Tumor' },           // red
+    { name: 'Lymph node' },      // green
+    { name: 'Bone metastasis' }, // blue
+    { name: 'Physiological' },   // yellow
+    { name: 'Inflammation' },    // magenta
+    { name: 'Other' },           // cyan
 ];
 
 interface State {
@@ -92,9 +104,11 @@ export const useSegmentationStore = defineStore('segmentation', {
         threshold: 2.5,
         thresholdUnit: 'SUV',
 
-        labels: [
-            { id: 1, name: 'lesion1', color: DEFAULT_LABEL_PALETTE[0] },
-        ],
+        labels: DEFAULT_LABELS.map((l, i) => ({
+            id: i + 1,
+            name: l.name,
+            color: DEFAULT_LABEL_PALETTE[i % DEFAULT_LABEL_PALETTE.length],
+        })),
         currentLabelId: 1,
 
         sphere: null,
@@ -326,6 +340,54 @@ export const useSegmentationStore = defineStore('segmentation', {
             }
             this.maskVersion++;
             return n;
+        },
+
+        loadMaskFromNifti(
+            mask: Uint16Array,
+            dims: [number, number, number],
+            sidecar?: {
+                threshold?: number;
+                thresholdUnit?: 'SUV' | 'CNTS';
+                labels?: LabelEntry[];
+            } | null,
+        ): { ok: true } | { ok: false; reason: string } {
+            const pet = this.petVolumeRef;
+            if (!pet) {
+                return { ok: false, reason: 'No PET volume is loaded. Load a PET volume first.' };
+            }
+            if (dims[0] !== pet.nx || dims[1] !== pet.ny || dims[2] !== pet.nz) {
+                return {
+                    ok: false,
+                    reason: `Mask dims (${dims[0]} x ${dims[1]} x ${dims[2]}) do not match current PET volume (${pet.nx} x ${pet.ny} x ${pet.nz}).`,
+                };
+            }
+            this.ensureMaskAllocated();
+            const me = this.manualEdits!;
+            const tm = this.thresholdMask!;
+            me.set(mask);
+            tm.fill(0);
+            this.undoStack = [];
+            this.recomputeFinalMask();
+            this.invalidateComponentMap();
+            this.maskVersion++;
+
+            if (sidecar) {
+                if (typeof sidecar.threshold === 'number' && Number.isFinite(sidecar.threshold)) {
+                    this.threshold = sidecar.threshold;
+                }
+                if (sidecar.thresholdUnit === 'SUV' || sidecar.thresholdUnit === 'CNTS') {
+                    this.thresholdUnit = sidecar.thresholdUnit;
+                }
+                if (Array.isArray(sidecar.labels) && sidecar.labels.length > 0) {
+                    this.labels = sidecar.labels.map(l => ({
+                        id: l.id,
+                        name: l.name,
+                        color: [l.color[0], l.color[1], l.color[2]] as [number, number, number],
+                    }));
+                    this.currentLabelId = this.labels[0].id;
+                }
+            }
+            return { ok: true };
         },
 
         saveMaskAsNifti(filename?: string): boolean {

@@ -12,6 +12,16 @@ defineProps<{
     fileCount: number;
     hasVolume: boolean;
     thumbnail: string | null;
+    seriesUID: string;
+    transferSyntaxName: string;
+    transferSyntaxSupported: boolean;
+    transferSyntaxReason?: string;
+    acquisitionTime?: string;
+    studyDate?: string;
+    studyUID?: string;
+    attenuationCorrected?: boolean;
+    isPrimary: boolean;
+    isRgb: boolean;
   }>;
 }>();
 
@@ -23,25 +33,32 @@ const emit = defineEmits([
   "presetSelected",
   "changeSeries",
   "changeSlice",
-  "mpr",
-  "axi",
-  "cor",
-  "mip",
-  "smip",
-  "monochrome",
-  "rainbow",
-  "hot",
-  "reverse",
   "phantom1",
   "phantom2",
   "phantom3",
-  "fusion",
-  "maximize",
   "redraw",
-  "selectSeries",
+  "setModality",
+  "setActiveForSeg",
 ]);
 
-const presetClicked = (e: string) => emit("presetSelected", e);
+// 最後にクリックした preset を track して active 表示。
+// Reset または window tool で WC/WW を直接いじったら null に戻る (今は前者のみ実装)。
+const activePreset = ref<string | null>(null);
+
+const presetClicked = (e: string) => {
+  if (e === 'Reset') activePreset.value = null;
+  else activePreset.value = e;
+  emit("presetSelected", e);
+};
+const onPresetToggle = (val: string | null | undefined) => {
+  // v-btn-toggle で active が変わったとき: 同じ button をもう 1 度押すと null になる
+  if (val == null) {
+    activePreset.value = null;
+    emit("presetSelected", "Reset");
+  } else {
+    presetClicked(val);
+  }
+};
 const changeSeries = (e: number) => emit("changeSeries", e);
 const changeSlice = (e: number) => emit("changeSlice", e);
 
@@ -49,6 +66,7 @@ const showAdvanced = ref(false);
 const showSummary = ref(false);
 const showTag = ref(false);
 
+// CT 用 (HU window)
 const wPresets = [
   { id: 'Lung',  label: 'Lung'  },
   { id: 'Med',   label: 'Med'   },
@@ -56,6 +74,14 @@ const wPresets = [
   { id: 'Bone',  label: 'Bone'  },
   { id: 'Brain', label: 'Brain' },
   { id: 'Fat',   label: 'Fat'   },
+];
+
+// PET 用 (SUV window) -- WC = (lo+hi)/2, WW = hi-lo として DicomView 側で展開
+const wPresetsPet = [
+  { id: 'SUV-0-3',  label: '0-3'  },
+  { id: 'SUV-0-6',  label: '0-6'  },
+  { id: 'SUV-0-10', label: '0-10' },
+  { id: 'SUV-0-15', label: '0-15' },
 ];
 </script>
 
@@ -78,7 +104,8 @@ const wPresets = [
       </div>
       <SeriesList
         :series="seriesSummaries ?? []"
-        @select="(i: number) => emit('selectSeries', i)"
+        @setModality="(p: { index: number; modality: 'PT' | 'CT' }) => emit('setModality', p)"
+        @setActiveForSeg="(p: { index: number; modality: 'PT' | 'CT' }) => emit('setActiveForSeg', p)"
       />
     </section>
 
@@ -108,47 +135,48 @@ const wPresets = [
     <section class="mv-section">
       <div class="mv-section-title">
         <v-icon icon="mdi-contrast-circle" size="x-small" />
-        Window preset
+        Window preset (CT)
       </div>
-      <div class="mv-btn-row">
+      <v-btn-toggle
+        :model-value="activePreset"
+        @update:model-value="onPresetToggle"
+        density="compact"
+        variant="outlined"
+        divided
+        class="mv-preset-toggle"
+      >
         <v-btn
           v-for="p in wPresets"
           :key="p.id"
+          :value="p.id"
           size="x-small"
-          variant="tonal"
-          @click="presetClicked(p.id)"
         >{{ p.label }}</v-btn>
-        <v-btn size="x-small" variant="outlined" color="primary" @click="presetClicked('Reset')">Reset</v-btn>
-      </div>
-    </section>
+      </v-btn-toggle>
 
-    <!-- Color -->
-    <section class="mv-section">
-      <div class="mv-section-title">
-        <v-icon icon="mdi-palette" size="x-small" />
-        Color
+      <div class="mv-section-title mt-3">
+        <v-icon icon="mdi-radioactive" size="x-small" />
+        SUV window (PT)
       </div>
-      <div class="mv-btn-row">
-        <v-btn size="x-small" variant="tonal" @click="emit('monochrome')">Mono</v-btn>
-        <v-btn size="x-small" variant="tonal" @click="emit('rainbow')">Rainbow</v-btn>
-        <v-btn size="x-small" variant="tonal" @click="emit('hot')">Hot</v-btn>
-        <v-btn size="x-small" variant="tonal" @click="emit('reverse')">Reverse</v-btn>
-      </div>
-    </section>
+      <v-btn-toggle
+        :model-value="activePreset"
+        @update:model-value="onPresetToggle"
+        density="compact"
+        variant="outlined"
+        divided
+        class="mv-preset-toggle"
+      >
+        <v-btn
+          v-for="p in wPresetsPet"
+          :key="p.id"
+          :value="p.id"
+          size="x-small"
+        >{{ p.label }}</v-btn>
+      </v-btn-toggle>
 
-    <!-- 3D / View -->
-    <section class="mv-section">
-      <div class="mv-section-title">
-        <v-icon icon="mdi-cube-outline" size="x-small" />
-        View
-      </div>
-      <div class="mv-btn-row">
-        <v-btn size="x-small" variant="tonal" @click="emit('mpr')">MPR</v-btn>
-        <v-btn size="x-small" variant="tonal" @click="emit('axi')">Axi</v-btn>
-        <v-btn size="x-small" variant="tonal" @click="emit('cor')">Cor</v-btn>
-        <v-btn size="x-small" variant="tonal" @click="emit('mip')">MIP</v-btn>
-        <v-btn size="x-small" variant="tonal" @click="emit('smip')">sMIP</v-btn>
-        <v-btn size="x-small" variant="tonal" @click="emit('fusion')">Fusion</v-btn>
+      <div class="mv-btn-row mt-2">
+        <v-btn size="x-small" variant="text" @click="presetClicked('Reset')">
+          <v-icon icon="mdi-restart" size="x-small" class="mr-1" />Reset to DICOM tag
+        </v-btn>
       </div>
     </section>
 
@@ -187,5 +215,24 @@ const wPresets = [
   display: flex;
   flex-direction: column;
   padding-top: 4px;
+}
+
+/* Window preset segmented control: 横一杯に 6 等分、各 btn を細めに */
+.mv-preset-toggle {
+  width: 100%;
+}
+.mv-preset-toggle :deep(.v-btn) {
+  flex: 1 1 0;
+  min-width: 0 !important;
+  padding: 0 4px !important;
+  font-size: 11px !important;
+  letter-spacing: 0;
+  text-transform: none;
+  height: 26px !important;
+}
+.mv-preset-toggle :deep(.v-btn--active) {
+  background: rgba(0, 212, 170, 0.16) !important;
+  color: var(--mv-accent) !important;
+  border-color: var(--mv-accent-dim) !important;
 }
 </style>

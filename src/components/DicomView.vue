@@ -36,6 +36,9 @@ import { ImageBoxInfoBase, DicomImageBoxInfo, VolumeImageBoxInfo, defaultInfo, p
 import { getAllFilesRecursive } from "./DragAndDropUtil";
 import { generateVolumeFromDicom } from './dicom2volume.ts';
 import * as DecompressJpegLossless from "./decompressJpegLossless";
+import { getSeriesTransferSyntaxInfo } from "./transferSyntax";
+import { isPrimaryForFusion, isRgbSeries } from "./seriesClassify";
+import { ensureWasmCodecsReady, isWasmCodecsReady } from "./wasmCodec";
 import { Volume, voxelToWorld, worldToVoxel } from "./Volume.ts";
 import * as THREE from 'three';
 import {cluts, labelClut} from './Clut.ts';
@@ -45,7 +48,7 @@ import { useSegmentationStore } from '../stores/segmentation';
 import { sphereStatsInPet, fillPolygonOnSlice, findMaximumAxis as maxAxis } from './segmentation/maskOps';
 import SegmentationPanel from './SegmentationPanel.vue';
 import DebugInspector from './DebugInspector.vue';
-import { computed, onMounted, nextTick } from 'vue';
+import { computed, onMounted, nextTick, provide } from 'vue';
 
 const segStore = useSegmentationStore();
 
@@ -122,6 +125,19 @@ export interface SeriesSummary {
   fileCount: number;
   hasVolume: boolean;
   thumbnail: string | null; // dataURL
+  seriesUID: string;        // for active-for-segmentation matching
+  // 圧縮対応状況 (★1)
+  transferSyntaxName: string;
+  transferSyntaxSupported: boolean;
+  transferSyntaxReason?: string;
+  // PT 識別用フィールド (★3)
+  acquisitionTime?: string;     // "08:34"
+  studyDate?: string;           // "2026-04-15"
+  studyUID?: string;
+  attenuationCorrected?: boolean; // true/false (PT only) / undefined for non-PT
+  // PET-CT fusion 解析に使えるか (false なら Sidebar の Other セクションに分類)
+  isPrimary: boolean;
+  isRgb: boolean;     // RGB / カラー画像 (thumbnail 生成・表示の警告用)
 }
 const seriesSummaries = ref<SeriesSummary[]>([]);
 
@@ -142,9 +158,9 @@ const autoFitMode = ref(false);
 
 const applyAutoFit = () => {
   if (!autoFitMode.value) return;
-  const size = fitBoxSizeForCurrentTile();
-  imageBoxW.value = size;
-  imageBoxH.value = size;
+  const { w, h } = fitBoxSizeForCurrentTile();
+  imageBoxW.value = w;
+  imageBoxH.value = h;
 };
 
 // URL ?debug=1 で初期有効化、Ctrl+Shift+D で toggle
@@ -278,6 +294,247 @@ const isAnyVolumeBox = (i:number) => isVolumeImageBoxInfo(i) || isFusedImageBoxI
 
 const getSelectedInfo = () => getVolumeImageBoxInfo(selectedImageBoxId.value);
 
+// ---- Title bar 用 helpers ----
+type BoxKind = 'dicom' | 'volume' | 'fusion' | 'mip';
+const getBoxKind = (i: number): BoxKind => {
+  if (i < 0 || i >= imageBoxInfos.value.length) return 'volume';
+  if (isDicomImageBoxInfo(i)) return 'dicom';
+  if (isFusedImageBoxInfo(i)) return 'fusion';
+  if (isVolumeImageBoxInfo(i)) {
+    return getVolumeImageBoxInfo(i).isMip ? 'mip' : 'volume';
+  }
+  return 'volume';
+};
+
+const getBoxModalityLabel = (i: number): string => {
+  const kind = getBoxKind(i);
+  if (kind === 'fusion') return 'Fused';
+  if (kind === 'mip') return 'MIP';
+  if (kind === 'dicom') {
+    const info = getDicomImageBoxInfo(i);
+    const s = seriesList[info.currentSeriesNumber];
+    if (s && s.myDicom && s.myDicom.length > 0) {
+      const m = (s.myDicom[0].string('x00080060') ?? '').toUpperCase();
+      if (m === 'PT' || m === 'PET') return 'PT';
+      if (m === 'CT' || m === 'MR') return m;
+    }
+    return '2D';
+  }
+  // volume
+  const info = getVolumeImageBoxInfo(i);
+  const v = seriesList[info.currentSeriesNumber]?.volume;
+  return (v?.metadata?.modality ?? 'VOL').toUpperCase();
+};
+
+const getBoxDescription = (i: number): string => {
+  const info = imageBoxInfos.value[i];
+  return info?.description ?? '';
+};
+
+// 現在の plane を box state から導出。Volume の vecx/vecy/vecz を見て
+// determinePlaneDirection で軸面を判別、isMip を見て MIP/sMIP を判別。
+// 注意: defaultInfo (未ロードの初期状態) は clut を持つが vecx を持たないため、
+// `isAnyVolumeBox` が true を返しても vecx の defensive check が必須。
+const getBoxCurrentPlane = (i: number): 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | null => {
+  if (i < 0 || i >= imageBoxInfos.value.length) return null;
+  if (!isAnyVolumeBox(i)) return null;
+  const d = imageBoxInfos.value[i] as VolumeImageBoxInfo;
+  if (!d.vecx || !d.vecy || !d.vecz) return null;
+  if (d.isMip) return d.mip?.isSurface ? 'smip' : 'mip';
+  const dir = determinePlaneDirection(d);
+  if (dir === 'axial')    return 'axi';
+  if (dir === 'coronal')  return 'cor';
+  if (dir === 'sagittal') return 'sag';
+  return null;
+};
+const getBoxCurrentClut = (i: number): number | undefined => {
+  if (i < 0 || i >= imageBoxInfos.value.length) return undefined;
+  if (!isAnyVolumeBox(i)) return undefined;
+  return (imageBoxInfos.value[i] as VolumeImageBoxInfo).clut;
+};
+
+// per-box Sync opt-out
+const boxSyncEnabled = ref<boolean[]>([true, true, true, true, true, true, true, true]);
+const isBoxSyncEnabled = (i: number) => boxSyncEnabled.value[i] ?? true;
+
+// per-box mask overlay opt-out (true = この Box ではマスク非表示)
+const boxOverlayDisabled = ref<boolean[]>([false, false, false, false, false, false, false, false]);
+const isBoxOverlayEnabled = (i: number) => !boxOverlayDisabled.value[i];
+
+// ---- Title bar emit ハンドラ ----
+const onTitlebarClose = (i: number) => {
+  // Box を初期状態 (defaultInfo) に戻す
+  imageBoxInfos.value[i] = defaultInfo(i) as ImageBoxInfoBase;
+  imb.value?.[i]?.clear?.();
+  showImage(i);
+};
+
+const onTitlebarResetView = (i: number) => {
+  const info = imageBoxInfos.value[i];
+  if (!info) return;
+
+  if (isDicomImageBoxInfo(i)) {
+    const d = info as DicomImageBoxInfo;
+    d.myWC = null;
+    d.myWW = null;
+    d.centerX = 0;
+    d.centerY = 0;
+    d.zoom = null;
+  } else if (isAnyVolumeBox(i)) {
+    const d = info as VolumeImageBoxInfo;
+    const vol = seriesList[d.currentSeriesNumber]?.volume;
+    d.myWC = null;
+    d.myWW = null;
+    if (isFusedImageBoxInfo(i)) {
+      const f = d as FusedVolumeImageBoxInfo;
+      f.myWC1 = null;
+      f.myWW1 = null;
+    }
+    if (vol) {
+      // 中心を volume 中点へ
+      const p0 = voxelToWorld(new THREE.Vector3(0, 0, 0), vol);
+      const p1 = voxelToWorld(new THREE.Vector3(vol.nx, vol.ny, vol.nz), vol);
+      d.centerInWorld = p0.add(p1).divideScalar(2);
+      // 現在 plane の canonical 軸でリセット (zoom=1)
+      const plane = getBoxCurrentPlane(i);
+      if (plane === 'axi' || plane == null) {
+        d.vecx = vol.vectorX.clone();
+        d.vecy = vol.vectorY.clone();
+        d.vecz = vol.vectorZ.clone();
+      } else if (plane === 'cor') {
+        d.vecx = vol.vectorX.clone();
+        d.vecy = vol.vectorZ.clone().normalize().multiplyScalar(vol.vectorX.length());
+        d.vecz = vol.vectorY.clone();
+      } else if (plane === 'sag') {
+        d.vecx = vol.vectorY.clone();
+        d.vecy = vol.vectorZ.clone().normalize().multiplyScalar(vol.vectorY.length());
+        d.vecz = vol.vectorX.clone();
+      }
+      // MIP は angle のみリセット (mode は維持)
+      if (d.isMip && d.mip) {
+        d.mip.mipAngle = 0;
+      }
+    }
+  }
+  showImage(i);
+};
+
+const setPlaneOnBox = (i: number, plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip') => {
+  if (!isAnyVolumeBox(i)) return;
+  const d = imageBoxInfos.value[i] as VolumeImageBoxInfo;
+
+  if (plane === 'mip' || plane === 'smip') {
+    d.isMip = true;
+    if (d.mip == null) {
+      d.mip = { mipAngle: 0, isSurface: plane === 'smip', thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 };
+    } else {
+      d.mip.isSurface = (plane === 'smip');
+    }
+    showImage(i);
+    return;
+  }
+
+  // axi / cor / sag: 元 volume の canonical 軸を起点に再構築
+  d.isMip = false;
+  const vol = seriesList[d.currentSeriesNumber]?.volume;
+  if (!vol) {
+    showImage(i);
+    return;
+  }
+  // ズーム倍率 (現 vec 長 / canonical 長) を保持して再構築
+  const xZoom = d.vecx.length() / Math.max(1e-9, vol.vectorX.length());
+  const yZoom = d.vecy.length() / Math.max(1e-9, vol.vectorY.length());
+
+  if (plane === 'axi') {
+    d.vecx = vol.vectorX.clone().multiplyScalar(xZoom);
+    d.vecy = vol.vectorY.clone().multiplyScalar(yZoom);
+    d.vecz = vol.vectorZ.clone();
+  } else if (plane === 'cor') {
+    d.vecx = vol.vectorX.clone().multiplyScalar(xZoom);
+    d.vecy = vol.vectorZ.clone().normalize().multiplyScalar(d.vecx.length());
+    d.vecz = vol.vectorY.clone();
+  } else if (plane === 'sag') {
+    d.vecx = vol.vectorY.clone().multiplyScalar(xZoom);
+    d.vecy = vol.vectorZ.clone().normalize().multiplyScalar(d.vecx.length());
+    d.vecz = vol.vectorX.clone();
+  }
+  showImage(i);
+};
+
+const setClutOnBox = (i: number, clutId: number) => {
+  if (!isAnyVolumeBox(i)) return;
+  const d = imageBoxInfos.value[i] as VolumeImageBoxInfo;
+  if (clutId === -1) {
+    // Reverse: ペアトグル (0↔1, 2↔3, 4↔5)
+    if (d.clut % 2 === 0) d.clut = d.clut + 1;
+    else d.clut = d.clut - 1;
+  } else {
+    d.clut = clutId;
+  }
+  showImage(i);
+};
+
+const onTitlebarSetPlane = (i: number, plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip') => {
+  setPlaneOnBox(i, plane);
+};
+const onTitlebarSetClut = (i: number, clut: number) => {
+  setClutOnBox(i, clut);
+};
+const onTitlebarToggleSync = (i: number) => {
+  if (i < 0) return;
+  while (boxSyncEnabled.value.length <= i) boxSyncEnabled.value.push(true);
+  boxSyncEnabled.value[i] = !boxSyncEnabled.value[i];
+};
+
+// ---- Maximize / Restore ----
+// tileN を 1 に切り替え、選んだ box info を slot 0 に swap する。
+// 復元時は swap し戻して元 tileN に戻す。
+let maximizedState: { prevTileN: number; originalSlot: number } | null = null;
+
+const onTitlebarMaximize = (i: number) => {
+  if (maximizedState !== null) {
+    // Restore
+    const slot = maximizedState.originalSlot;
+    if (slot !== 0) {
+      const tmp = imageBoxInfos.value[0];
+      imageBoxInfos.value[0] = imageBoxInfos.value[slot];
+      imageBoxInfos.value[slot] = tmp;
+    }
+    tileN.value = maximizedState.prevTileN;
+    maximizedState = null;
+    nextTick(() => show());
+    return;
+  }
+
+  // Maximize
+  maximizedState = {
+    prevTileN: tileN.value ?? 1,
+    originalSlot: i,
+  };
+  if (i !== 0) {
+    const tmp = imageBoxInfos.value[0];
+    imageBoxInfos.value[0] = imageBoxInfos.value[i];
+    imageBoxInfos.value[i] = tmp;
+  }
+  tileN.value = 1;
+  nextTick(() => show());
+};
+const onTitlebarToggleOverlay = (i: number) => {
+  if (i < 0) return;
+  while (boxOverlayDisabled.value.length <= i) boxOverlayDisabled.value.push(false);
+  boxOverlayDisabled.value[i] = !boxOverlayDisabled.value[i];
+  showImage(i);
+};
+const onTitlebarMakeMpr = (i: number) => {
+  if (!isDicomImageBoxInfo(i)) return;
+  const info = getDicomImageBoxInfo(i);
+  const seriesIdx = info.currentSeriesNumber;
+  if (seriesIdx < 0 || seriesIdx >= seriesList.length) return;
+  if (!seriesList[seriesIdx].myDicom || seriesList[seriesIdx].myDicom!.length === 0) return;
+  mpr_(seriesIdx);
+  showImage(i);
+};
+
 type LeftButtonFunction = "window" | "pan" | "zoom" | "page" | "sphereROI" | "polygonROI" | "assignLabel";
 // const leftButtonFunction = ref<LeftButtonFunction>("none");
 const leftButtonFunctionChanged = (e: LeftButtonFunction) => {
@@ -334,27 +591,48 @@ const getMyWCWW1 = (i:number) => {
 
 const presetSelected = (e: string) => {
   const id = selectedImageBoxId.value;
+  // CT (HU) presets
   if (e === "Lung") setMyWCWW(id, -700, 1800);
   if (e === "Abd") setMyWCWW(id, 30, 200);
   if (e === "Med") setMyWCWW(id, 0, 320);
   if (e === "Fat") setMyWCWW(id, 10, 275);
   if (e === "Bone") setMyWCWW(id, 200, 2000);
   if (e === "Brain") setMyWCWW(id, 30, 80);
+  // PET (SUV) presets — WC = (lo+hi)/2, WW = hi-lo
+  if (e === "SUV-0-3")  setMyWCWW(id, 1.5, 3);
+  if (e === "SUV-0-6")  setMyWCWW(id, 3,   6);
+  if (e === "SUV-0-10") setMyWCWW(id, 5,  10);
+  if (e === "SUV-0-15") setMyWCWW(id, 7.5, 15);
   if (e === "Reset") setMyWCWW(id, null, null);
   show();
 };
 
 const dragEnter = () => { isEnter.value = true; }
 const dragLeave = () => { isEnter.value = false; }
-const dropFile = async (e: DragEvent) => {
-  const files = await getAllFilesRecursive(e);
-  loadFiles(files);
+
+// drop は 2 種類:
+//  (a) ファイル/フォルダ drop → loadFiles
+//  (b) Sidebar の series card drop → 受けた box の series を差し替え
+const dropFile = async (e: DragEvent, boxId?: number) => {
   isEnter.value = false;
+  const seriesIdxStr = e.dataTransfer?.getData('application/x-metavol-series');
+  if (seriesIdxStr) {
+    const idx = Number(seriesIdxStr);
+    const target = boxId ?? selectedImageBoxId.value;
+    if (!isNaN(idx) && idx >= 0 && idx < seriesList.length) {
+      onSelectSeriesIntoBox(idx, target);
+    }
+    return;
+  }
+  const files = await getAllFilesRecursive(e);
+  if (files && files.length > 0) loadFiles(files);
 };
 
 const doOneOrAll = (id: number, action: (i:number) => void ) => {
   if (syncImageBox.value){
     for (let i=0; i<imb.value!.length; i++){
+      // 発信元 (id) は常に実行、それ以外は per-box opt-out 判定
+      if (i !== id && !isBoxSyncEnabled(i)) continue;
       action(i);
     }
   }else{
@@ -363,11 +641,13 @@ const doOneOrAll = (id: number, action: (i:number) => void ) => {
 }
 
 // Pan の実体ロジック（左ボタン pan ツール / Ctrl+中ボタン から共通利用）
+// 注意: target box i ごとに DICOM/Volume を判定する。source id では sync 群内で
+// 混合 (DICOM + Volume) すると panning が破綻するため。
 const doPan = (id: number, dx: number, dy: number) => {
   const info = getDicomImageBoxInfo;
   const infoV = getVolumeImageBoxInfo;
   doOneOrAll(id, (i:number) => {
-    if (isDicomImageBoxInfo(id)){
+    if (isDicomImageBoxInfo(i)){
       const zoom = info(i).zoom!;
       info(i).centerX -= dx / zoom;
       info(i).centerY -= dy / zoom;
@@ -426,7 +706,7 @@ const mouseMove = (e: MouseEvent) => {
   if (leftButtonFunction.value == "zoom") {
     if (e.buttons == 1) {
       doOneOrAll(id, (i:number) => {
-        if (isDicomImageBoxInfo(id)){
+        if (isDicomImageBoxInfo(i)){
           let r = 1.02;
           if (e.movementY > 0) r = 1 / r;
           const zoom = info(i).zoom ?? 1;
@@ -755,9 +1035,11 @@ const changeSeries = (i:number) => {
   }
 }
 
-const onSelectSeriesFromCard = (idx: number) => {
+// シリーズ idx を box id にロードする (drop ハンドラから呼ばれる)。
+const onSelectSeriesIntoBox = (idx: number, id: number) => {
   if (idx < 0 || idx >= seriesList.length) return;
-  const id = selectedImageBoxId.value;
+  if (id < 0 || id >= imageBoxInfos.value.length) return;
+  selectedImageBoxId.value = id;
   const info = imageBoxInfos.value[id];
   // 既存の Box が DICOM 表示中なら currentSeriesNumber を切替、Volume 表示中なら mpr_ で再構築
   if (isDicomImageBoxInfo(id)){
@@ -767,7 +1049,7 @@ const onSelectSeriesFromCard = (idx: number) => {
   } else {
     // Volume 表示中: 該当シリーズが volume を持たないなら生成
     if (!seriesList[idx].volume && seriesList[idx].myDicom){
-      mpr_(idx);
+      if (!mpr_(idx)) return;
     }
     if (seriesList[idx].volume){
       const v = seriesList[idx].volume!;
@@ -789,6 +1071,84 @@ const onSelectSeriesFromCard = (idx: number) => {
       } as VolumeImageBoxInfo;
     }
   }
+  show();
+};
+
+const hasNonZeroMask = (m: Uint16Array | null): boolean => {
+  if (!m) return false;
+  for (let i = 0; i < m.length; i++) {
+    if (m[i] !== 0) return true;
+  }
+  return false;
+};
+
+const onSetActiveForSeg = (payload: { index: number; modality: 'PT' | 'CT' }) => {
+  const { index, modality } = payload;
+  if (index < 0 || index >= seriesList.length) return;
+  const s = seriesList[index];
+  if (!s) return;
+
+  // Volume が未生成なら mpr_ で生成 (DICOM 必須)。未対応圧縮なら mpr_ が false を返す。
+  if (!s.volume) {
+    if (!s.myDicom || s.myDicom.length === 0) {
+      alert('Cannot activate: this series has no volume and no DICOM files.');
+      return;
+    }
+    if (!mpr_(index)) return;
+  }
+  const v = s.volume;
+  if (!v) return;
+
+  // 切り替え先 seriesUID と現在 active が同じならノーオペで OK (mask 保持される)。
+  const targetUid = v.metadata?.seriesUID ?? '';
+  const currentRef = modality === 'PT' ? segStore.petVolumeRef : segStore.ctVolumeRef;
+  const currentUid = currentRef?.metadata?.seriesUID ?? '';
+  const isSwitch = !!targetUid && !!currentUid && targetUid !== currentUid;
+
+  // PT を別 series に切り替え + マスク編集が乗っているとき: confirm
+  if (isSwitch && modality === 'PT') {
+    const dirty = hasNonZeroMask(segStore.finalMask) || hasNonZeroMask(segStore.manualEdits);
+    if (dirty) {
+      const ok = window.confirm(
+        'Switching the active PT will discard the current segmentation mask and labels.\n\nProceed?'
+      );
+      if (!ok) return;
+    }
+  }
+
+  if (modality === 'PT') {
+    segStore.setPetVolume(v);
+  } else {
+    segStore.setCtVolume(v);
+  }
+  rebuildSeriesSummaries();
+  show();
+};
+
+const onSetSeriesModality = (payload: { index: number; modality: 'PT' | 'CT' }) => {
+  const { index, modality } = payload;
+  if (index < 0 || index >= seriesList.length) return;
+  const v = seriesList[index].volume;
+  if (!v) return;
+  const existing = v.metadata;
+  v.metadata = {
+    modality,
+    seriesUID: existing?.seriesUID ?? `nii-${index}-${Date.now()}`,
+    seriesDescription: existing?.seriesDescription,
+    suvFactor: existing?.suvFactor,
+    patientWeightKg: existing?.patientWeightKg,
+    radionuclideHalfLifeSec: existing?.radionuclideHalfLifeSec,
+    radionuclideTotalDoseBq: existing?.radionuclideTotalDoseBq,
+    doseStartTimeSec: existing?.doseStartTimeSec,
+    acquisitionTimeSec: existing?.acquisitionTimeSec,
+    units: existing?.units,
+  };
+  if (modality === 'PT') {
+    segStore.setPetVolume(v);
+  } else {
+    segStore.setCtVolume(v);
+  }
+  rebuildSeriesSummaries();
   show();
 };
 
@@ -869,6 +1229,60 @@ const loadFile = async (file: File) => {
   loadFiles([file]);
 };
 
+// JPEG Lossless 圧縮されている全フレームを WASM (dcmjs-codecs) で復号する。
+// WASM は main thread で sync 実行され純 JS 比 5-20x 速いため Web Worker は不要。
+// frame ごとに setTimeout(0) で event loop に譲り UI 応答性を保つ。
+// 完了後は rebuildSeriesSummaries() でサムネを再生成し、show() で即時反映。
+const jpegDecompressInProgress = ref(false);
+const jpegDecompressDone = ref(0);
+const jpegDecompressTotal = ref(0);
+
+const decompressAllJpegLossless = async (): Promise<void> => {
+  // 対象フレーム収集
+  const targets: MyDicom[] = [];
+  for (const s of seriesList) {
+    if (!s.myDicom) continue;
+    for (const ds of s.myDicom) {
+      if (DecompressJpegLossless.check(ds) && (ds as MyDicom).decompressed == null) {
+        targets.push(ds as MyDicom);
+      }
+    }
+  }
+  if (targets.length === 0) return;
+
+  // WASM プリウォーム (初回のみ実 fetch + instantiate; ~500ms 程度)。
+  try {
+    await ensureWasmCodecsReady();
+  } catch (err) {
+    console.warn('[jpeg-lossless] WASM init failed; using JS fallback for all frames', err);
+  }
+
+  jpegDecompressInProgress.value = true;
+  jpegDecompressTotal.value = targets.length;
+  jpegDecompressDone.value = 0;
+  const t0 = performance.now();
+  const backend = isWasmCodecsReady() ? 'WASM (dcmjs-codecs)' : 'JS (jpeg-lossless-decoder-js)';
+  console.log(`[jpeg-lossless] decompressing ${targets.length} frames via ${backend}...`);
+
+  for (const ds of targets) {
+    try {
+      ds.decompressed = DecompressJpegLossless.decode(ds);
+    } catch (err) {
+      console.warn('[jpeg-lossless] frame decode failed', err);
+    }
+    jpegDecompressDone.value++;
+    // 8 frame ごとに event loop へ譲る (UI 応答性確保、WASM は速いので頻度低めで OK)
+    if (jpegDecompressDone.value % 8 === 0) {
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+  const t1 = performance.now();
+  const ms = (t1 - t0);
+  const perFrame = (ms / targets.length).toFixed(2);
+  console.log(`[jpeg-lossless] decompressed ${jpegDecompressDone.value} frames in ${ms.toFixed(0)}ms (${perFrame} ms/frame, ${backend})`);
+  jpegDecompressInProgress.value = false;
+};
+
 const loadFiles = (files: FileList | File[]) => {
   initializeDicomListsImagesBoxInfos();
   const localFileList = Array.from(files);
@@ -889,6 +1303,11 @@ const loadFiles = (files: FileList | File[]) => {
       doSort();
       show();
       isLoading.value = false;
+      // 背景で全 JPEG Lossless frame を decompress。完了後にサムネ再生成 + 再描画。
+      decompressAllJpegLossless().then(() => {
+        rebuildSeriesSummaries();
+        show();
+      });
     }
   };
   intervalId = setInterval(callback, 100);
@@ -967,6 +1386,12 @@ const showImage = (i:number) => {
       if (dataSet === undefined) {
         imb.value![i].clear();
       } else {
+        // ★1: 未対応 transfer syntax の DICOM は明示エラーで empty state 表示
+        const _ts = getSeriesTransferSyntaxInfo([dataSet]);
+        if (!_ts.supported) {
+          imb.value![i].clear(`Unsupported: ${_ts.name}`);
+          return;
+        }
         // DICOM Library https://www.dicomlibrary.com/dicom/dicom-tags/
         // const studyInstanceUid = dataSet.string('x0020000d');
         // const patientid = dataSet.string('x00100020');
@@ -992,6 +1417,12 @@ const showImage = (i:number) => {
         info.description = dataSet.string("x0008103e") ?? "SeriesName";
 
         const pixelDataElement = dataSet.elements.x7fe00010;
+        // pixel data 要素を持たない DICOM (Structured Report / Presentation State 等) は
+        // 表示できないので明示エラーで empty state にして抜ける。
+        if (!pixelDataElement) {
+          imb.value![i].clear('No pixel data in this DICOM');
+          return;
+        }
 
         // 2024/5/12 ここでjpeg解凍するのはあまりよろしくない。事前に非同期でしたい。今日のところは我慢する。
         if (DecompressJpegLossless.check(dataSet) && dataSet.decompressed == null){
@@ -1039,7 +1470,7 @@ const showImage = (i:number) => {
       // （マスクは PET 格子と同形なので、同じ pix と同じ index で参照可能）
       const petIdx = findPetSeriesIndex();
       const overlayForMip = (info.currentSeriesNumber === petIdx)
-        ? buildMipMaskOverlay()
+        ? buildMipMaskOverlay(i)
         : undefined;
       imb.value![i].drawNiftiMip(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,
         angle, info.mip!.thresholdSurfaceMip, info.mip!.depthSurfaceMip, clut,
@@ -1186,8 +1617,9 @@ const findPetSeriesIndex = (): number => {
 // pix と一致している前提で、内部で投影マップを生成する。
 // p00/v01/v10 は drawNiftiMip 側では使われない（投影後の 2D 配列で参照）が、
 // 型を満たすためにダミーで渡す。
-const buildMipMaskOverlay = () => {
+const buildMipMaskOverlay = (boxId?: number) => {
   if (!segStore.overlayEnabled) return undefined;
+  if (boxId !== undefined && !isBoxOverlayEnabled(boxId)) return undefined;
   const mask = segStore.finalMask;
   const pet = segStore.petVolumeRef;
   if (!mask || !pet) return undefined;
@@ -1204,6 +1636,7 @@ const buildMipMaskOverlay = () => {
 
 const buildMaskOverlayForBox = (i: number) => {
   if (!segStore.overlayEnabled) return undefined;
+  if (!isBoxOverlayEnabled(i)) return undefined;
   const mask = segStore.finalMask;
   const pet = segStore.petVolumeRef;
   if (!mask || !pet) return undefined;
@@ -1225,7 +1658,7 @@ const buildMaskOverlayForBox = (i: number) => {
 
 // 中央スライスから 96x96 のサムネイルを作る。
 // volume があれば voxel から、なければ DICOM 中央スライスから生成。
-const generateThumbnail = (s: SeriesList, modality: string): string | null => {
+const generateThumbnail = (s: SeriesList, modality: string, sliceIdx?: number): string | null => {
   const TH = 96;
   const cv = document.createElement('canvas');
   cv.width = TH; cv.height = TH;
@@ -1240,7 +1673,9 @@ const generateThumbnail = (s: SeriesList, modality: string): string | null => {
 
   if (s.volume){
     const v = s.volume;
-    const k = Math.floor(v.nz / 2);
+    const k = sliceIdx != null
+      ? Math.max(0, Math.min(v.nz - 1, sliceIdx))
+      : Math.floor(v.nz / 2);
     const wc = defaultWC, ww = defaultWW;
     let ad = 0;
     for (let y = 0; y < TH; y++){
@@ -1262,7 +1697,9 @@ const generateThumbnail = (s: SeriesList, modality: string): string | null => {
   }
   if (s.myDicom && s.myDicom.length > 0){
     try {
-      const k = Math.floor(s.myDicom.length / 2);
+      const k = sliceIdx != null
+        ? Math.max(0, Math.min(s.myDicom.length - 1, sliceIdx))
+        : Math.floor(s.myDicom.length / 2);
       const ds = s.myDicom[k];
       const rows = ds.int16("x00280010") ?? 512;
       const cols = ds.int16("x00280011") ?? 512;
@@ -1272,9 +1709,39 @@ const generateThumbnail = (s: SeriesList, modality: string): string | null => {
       const ww = Number(ds.string("x00281051", 0) ?? defaultWW);
       const pde = ds.elements.x7fe00010;
       if (!pde) return null;
-      // 圧縮系（jpeg lossless 等）はサムネ生成パスでは扱わない
-      if (DecompressJpegLossless.check(ds)) return null;
-      const i16 = new Int16Array(ds.byteArray.buffer, pde.dataOffset, pde.length / 2);
+      const photo = (ds.string("x00280004") ?? '').toUpperCase();
+
+      // RGB 8bit interleaved: そのまま色をサンプリング (windowing 不要)
+      if (photo === 'RGB') {
+        const u8 = new Uint8Array(ds.byteArray.buffer, pde.dataOffset, pde.length);
+        let ad = 0;
+        for (let y = 0; y < TH; y++) {
+          for (let x = 0; x < TH; x++) {
+            const px = Math.floor(x / TH * cols);
+            const py = Math.floor(y / TH * rows);
+            const adP = (py * cols + px) * 3;
+            img.data[ad]   = u8[adP]   ?? 0;
+            img.data[ad+1] = u8[adP+1] ?? 0;
+            img.data[ad+2] = u8[adP+2] ?? 0;
+            img.data[ad+3] = 255;
+            ad += 4;
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+        return cv.toDataURL('image/png');
+      }
+
+      // grayscale 16bit (MONOCHROME1/2 含む)
+      // JPEG Lossless: decompressed キャッシュがあればそれを使う、無ければ
+      // サムネ生成は諦める (背景 decompress が完了すれば再 build される)
+      let i16: Int16Array;
+      if (DecompressJpegLossless.check(ds)) {
+        const cached = (ds as MyDicom).decompressed;
+        if (cached == null) return null;
+        i16 = new Int16Array(cached, 0, (cached as ArrayBuffer).byteLength / 2);
+      } else {
+        i16 = new Int16Array(ds.byteArray.buffer, pde.dataOffset, pde.length / 2);
+      }
       let ad = 0;
       for (let y = 0; y < TH; y++){
         for (let x = 0; x < TH; x++){
@@ -1326,6 +1793,54 @@ const rebuildSeriesSummaries = () => {
       voxelSize = `${v.vectorX.length().toFixed(2)}×${v.vectorY.length().toFixed(2)}×${v.vectorZ.length().toFixed(2)} mm`;
     }
     if (!description) description = `Series ${i}`;
+    let seriesUID = '';
+    if (s.myDicom && s.myDicom.length > 0) {
+      seriesUID = s.myDicom[0].string('x0020000e') ?? '';
+    } else if (s.volume?.metadata?.seriesUID) {
+      seriesUID = s.volume.metadata.seriesUID;
+    }
+
+    // ★1: transfer syntax 判定
+    const tsInfo = s.myDicom && s.myDicom.length > 0
+      ? getSeriesTransferSyntaxInfo(s.myDicom)
+      : { name: 'NIfTI / Other', supported: true };
+
+    // ★3: PT 識別用フィールド
+    let acquisitionTime: string | undefined;
+    let studyDate: string | undefined;
+    let studyUID: string | undefined;
+    let attenuationCorrected: boolean | undefined;
+    if (s.myDicom && s.myDicom.length > 0) {
+      const ds = s.myDicom[0];
+      const at = ds.string('x00080032'); // AcquisitionTime "HHMMSS.FFFFFF"
+      if (at && at.length >= 4) {
+        acquisitionTime = `${at.substring(0,2)}:${at.substring(2,4)}`;
+      }
+      const sd = ds.string('x00080020'); // StudyDate "YYYYMMDD"
+      if (sd && sd.length >= 8) {
+        studyDate = `${sd.substring(0,4)}-${sd.substring(4,6)}-${sd.substring(6,8)}`;
+      }
+      studyUID = ds.string('x0020000d') ?? undefined;
+      if (modality === 'PT' || modality === 'PET') {
+        // (0028,0051) Corrected Image: backslash-separated values like "ATTN\\DECY"
+        const corrected = ds.string('x00280051') ?? '';
+        attenuationCorrected = corrected.toUpperCase().includes('ATTN');
+      }
+    }
+
+    const ds0 = s.myDicom?.[0];
+    const photometric = ds0?.string('x00280004');
+    const imageType   = ds0?.string('x00080008');
+    // フレーム数: DICOM は myDicom.length、NIfTI のみは volume.nz
+    const nFramesEffective = s.myDicom?.length ?? s.volume?.nz ?? 0;
+    const isPrimary = isPrimaryForFusion({
+      nFrames: nFramesEffective,
+      modality,
+      photometric,
+      imageType,
+    });
+    const isRgb = isRgbSeries(photometric);
+
     out.push({
       index: i,
       description,
@@ -1335,6 +1850,16 @@ const rebuildSeriesSummaries = () => {
       fileCount,
       hasVolume: !!s.volume,
       thumbnail: generateThumbnail(s, modality),
+      seriesUID,
+      transferSyntaxName: tsInfo.name,
+      transferSyntaxSupported: tsInfo.supported,
+      transferSyntaxReason: tsInfo.reason,
+      acquisitionTime,
+      studyDate,
+      studyUID,
+      attenuationCorrected,
+      isPrimary,
+      isRgb,
     });
   }
   seriesSummaries.value = out;
@@ -1370,7 +1895,13 @@ const refreshSegStoreVolumeRefs = () => {
   }
 };
 
-const mpr_ = (i: number) => {
+const mpr_ = (i: number): boolean => {
+  // ★1: 未対応 transfer syntax の series は MPR/Volume 生成を弾く
+  const ts = getSeriesTransferSyntaxInfo(seriesList[i].myDicom);
+  if (!ts.supported) {
+    alert(`Cannot create MPR: ${ts.reason ?? `unsupported transfer syntax (${ts.uid})`}.\n\nSeries: ${ts.name}`);
+    return false;
+  }
   const d = generateVolumeFromDicom(seriesList[i].myDicom!);
   seriesList[i].volume = d;
   refreshSegStoreVolumeRefs();
@@ -1394,6 +1925,7 @@ const mpr_ = (i: number) => {
     mip: null,
   } as VolumeImageBoxInfo;
 
+  return true;
 }
 
 
@@ -1590,23 +2122,42 @@ const gridStyle = computed(() => {
   return { gridTemplateColumns: `repeat(${cols}, max-content)` };
 });
 
-// 画像エリアのサイズから 2x2 がちょうど収まる正方形サイズを算出。
-// drawer (sidebar) 開閉、app-bar高さ、余白を差し引く。
-const computeFitBoxSize = (cols: number, rows: number) => {
-  const sidebarW = drawer.value ? 280 : 0;
-  const inspectorW = inspector.value ? 320 : 0;
-  const appBarH = 48;
-  const gap = 6 * (Math.max(cols, rows) - 1);
-  const padding = 16;
-  const availW = Math.max(200, window.innerWidth - sidebarW - inspectorW - padding);
-  const availH = Math.max(200, window.innerHeight - appBarH - padding);
-  const w = Math.floor((availW - gap) / cols);
-  const h = Math.floor((availH - gap) / rows);
-  return Math.max(150, Math.min(w, h));
+// 画像エリアのサイズから cols x rows がちょうど収まる box サイズを算出。
+// 正方形に固執せず、横と縦を独立に最大化して隙間を埋める。
+//
+// Vuetify の box-sizing: border-box / scrollbar の有無 / drawer の transition 中の
+// 中間サイズなど計算で詰めると環境依存で必ずズレる。.mv-imagearea 要素を直接測って
+// そこから padding / gap / title bar / safety を引くのが最も堅い。
+const TITLEBAR_H = 26;
+const GAP_PX = 6;             // .mv-tile-grid の gap
+const SAFETY_PX = 4;          // 各方向のクリッピング保険 (border 1px + 余裕)
+
+const computeFitBoxSize = (cols: number, rows: number): { w: number; h: number } => {
+  const ia = document.querySelector('.mv-imagearea') as HTMLElement | null;
+  let availW: number, availH: number;
+  if (ia) {
+    // imagearea は padding: 8px 入っているので clientWidth/Height で padding 内側を取る
+    availW = ia.clientWidth - 16;   // padding 8px each side
+    availH = ia.clientHeight - 16;
+  } else {
+    // mount 前のフォールバック
+    const sidebarW = drawer.value ? 280 : 0;
+    const inspectorW = inspector.value ? 320 : 0;
+    availW = Math.max(200, window.innerWidth - sidebarW - inspectorW - 16);
+    availH = Math.max(200, window.innerHeight - 48 - 16);
+  }
+
+  const gapH = GAP_PX * Math.max(0, cols - 1);
+  const gapV = GAP_PX * Math.max(0, rows - 1);
+
+  // 各 cell に title bar (1 行 26px) と border (約 2px) と保険 SAFETY_PX を引く
+  const w = Math.max(120, Math.floor((availW - gapH - cols * SAFETY_PX) / cols));
+  const h = Math.max(120, Math.floor((availH - gapV - rows * (TITLEBAR_H + SAFETY_PX)) / rows));
+  return { w, h };
 }
 
 // 現在の tileN と drawer 状態から最適な box サイズを返す
-const fitBoxSizeForCurrentTile = () => {
+const fitBoxSizeForCurrentTile = (): { w: number; h: number } => {
   const n = tileN.value ?? 1;
   const cols = gridCols(n);
   const rows = Math.ceil(n / cols);
@@ -1717,6 +2268,191 @@ const setupPetStandardView = async () => {
   show();
 }
 
+// ===== レイアウトプリセット =====
+// PET Standard と同じスタイルで複数のレイアウトを切り替え可能にする。
+
+// 与えた volume と plane で VolumeImageBoxInfo を生成する小ヘルパ。
+const makeVolumeBoxForPlane = (
+  volIdx: number,
+  plane: 'axi' | 'cor' | 'sag' | 'mip',
+  description: string,
+  clut: number,
+  wcWw: { wc: number; ww: number },
+  isMip = false,
+): VolumeImageBoxInfo => {
+  const v = seriesList[volIdx].volume!;
+  const p0 = voxelToWorld_(new THREE.Vector3(0, 0, 0), volIdx);
+  const p1 = voxelToWorld_(new THREE.Vector3(v.nx, v.ny, v.nz), volIdx);
+  const center = p0.add(p1).divideScalar(2);
+  let vecx: THREE.Vector3, vecy: THREE.Vector3, vecz: THREE.Vector3;
+  if (plane === 'cor') {
+    vecx = v.vectorX.clone();
+    vecy = v.vectorZ.clone().normalize().multiplyScalar(v.vectorX.length());
+    vecz = v.vectorY.clone();
+  } else if (plane === 'sag') {
+    vecx = v.vectorY.clone();
+    vecy = v.vectorZ.clone().normalize().multiplyScalar(v.vectorY.length());
+    vecz = v.vectorX.clone();
+  } else {
+    // axial / mip (mip uses axial vectors with isMip=true)
+    vecx = v.vectorX.clone();
+    vecy = v.vectorY.clone();
+    vecz = v.vectorZ.clone();
+  }
+  return {
+    clut, myWC: wcWw.wc, myWW: wcWw.ww, description,
+    currentSeriesNumber: volIdx, centerInWorld: center,
+    vecx, vecy, vecz, isMip,
+    mip: isMip ? { mipAngle: 0, isSurface: false, thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 } : null,
+  } as VolumeImageBoxInfo;
+};
+
+// L1 Triplanar PT: 1×3 (PT axial / coronal / sagittal)
+const setupTriplanarPt = async () => {
+  const petIdx = findPetSeriesIndex();
+  if (petIdx < 0) { alert('No PT series found.'); return; }
+  if (!seriesList[petIdx].volume) { if (!mpr_(petIdx)) return; }
+  const wcww = { wc: 3, ww: 6 };
+  imageBoxInfos.value[0] = makeVolumeBoxForPlane(petIdx, 'axi', 'PT axial',    1, wcww);
+  imageBoxInfos.value[1] = makeVolumeBoxForPlane(petIdx, 'cor', 'PT coronal',  1, wcww);
+  imageBoxInfos.value[2] = makeVolumeBoxForPlane(petIdx, 'sag', 'PT sagittal', 1, wcww);
+  tileN.value = 3;
+  refreshSegStoreVolumeRefs();
+  autoFitMode.value = true;
+  applyAutoFit();
+  await nextTick();
+  if (imb.value) for (const a of imb.value) a.init();
+  show();
+};
+
+// L2 Triplanar Fused: 1×3 (Fused axial / coronal / sagittal)
+const setupTriplanarFused = async () => {
+  const petIdx = findPetSeriesIndex();
+  let ctIdx = -1;
+  for (let i = 0; i < seriesList.length; i++) {
+    const v = seriesList[i].volume;
+    if (v && v.metadata?.modality === 'CT') { ctIdx = i; break; }
+    const dl = seriesList[i].myDicom;
+    if (dl && (dl[0]?.string('x00080060') ?? '').toUpperCase() === 'CT' && ctIdx < 0) ctIdx = i;
+  }
+  if (petIdx < 0 || ctIdx < 0) { alert('Both PT and CT series are required for Fusion.'); return; }
+  if (!seriesList[petIdx].volume) { if (!mpr_(petIdx)) return; }
+  if (!seriesList[ctIdx].volume)  { if (!mpr_(ctIdx))  return; }
+  const ct = seriesList[ctIdx].volume!;
+  const ctP0 = voxelToWorld_(new THREE.Vector3(0, 0, 0), ctIdx);
+  const ctP1 = voxelToWorld_(new THREE.Vector3(ct.nx, ct.ny, ct.nz), ctIdx);
+  const ctCenter = ctP0.add(ctP1).divideScalar(2);
+  const makeFused = (plane: 'axi' | 'cor' | 'sag', desc: string): FusedVolumeImageBoxInfo => {
+    let vecx: THREE.Vector3, vecy: THREE.Vector3, vecz: THREE.Vector3;
+    if (plane === 'cor') {
+      vecx = ct.vectorX.clone();
+      vecy = ct.vectorZ.clone().normalize().multiplyScalar(ct.vectorX.length());
+      vecz = ct.vectorY.clone();
+    } else if (plane === 'sag') {
+      vecx = ct.vectorY.clone();
+      vecy = ct.vectorZ.clone().normalize().multiplyScalar(ct.vectorY.length());
+      vecz = ct.vectorX.clone();
+    } else {
+      vecx = ct.vectorX.clone(); vecy = ct.vectorY.clone(); vecz = ct.vectorZ.clone();
+    }
+    return {
+      centerInWorld: ctCenter.clone(), vecx, vecy, vecz,
+      clut: 0, clut1: 2,
+      currentSeriesNumber: ctIdx, currentSeriesNumber1: petIdx,
+      description: desc, myWC: 40, myWW: 400, myWC1: 3, myWW1: 6,
+    } as FusedVolumeImageBoxInfo;
+  };
+  imageBoxInfos.value[0] = makeFused('axi', 'Fused axial');
+  imageBoxInfos.value[1] = makeFused('cor', 'Fused coronal');
+  imageBoxInfos.value[2] = makeFused('sag', 'Fused sagittal');
+  tileN.value = 3;
+  refreshSegStoreVolumeRefs();
+  autoFitMode.value = true;
+  applyAutoFit();
+  await nextTick();
+  if (imb.value) for (const a of imb.value) a.init();
+  show();
+};
+
+// L3 PT-only 4-up: 2×2 (PT axi / cor / sag / MIP)
+const setupPtOnly4up = async () => {
+  const petIdx = findPetSeriesIndex();
+  if (petIdx < 0) { alert('No PT series found.'); return; }
+  if (!seriesList[petIdx].volume) { if (!mpr_(petIdx)) return; }
+  const wcww = { wc: 3, ww: 6 };
+  imageBoxInfos.value[0] = makeVolumeBoxForPlane(petIdx, 'axi', 'PT axial',    1, wcww);
+  imageBoxInfos.value[1] = makeVolumeBoxForPlane(petIdx, 'cor', 'PT coronal',  1, wcww);
+  imageBoxInfos.value[2] = makeVolumeBoxForPlane(petIdx, 'sag', 'PT sagittal', 1, wcww);
+  // MIP は PET の coronal-like 視軸を使う (既存 PET Standard と同じ式)
+  const pet = seriesList[petIdx].volume!;
+  const pP0 = voxelToWorld_(new THREE.Vector3(0, 0, 0), petIdx);
+  const pP1 = voxelToWorld_(new THREE.Vector3(pet.nx, pet.ny, pet.nz), petIdx);
+  imageBoxInfos.value[3] = {
+    clut: 1, myWC: 3, myWW: 6, description: 'PT MIP',
+    currentSeriesNumber: petIdx,
+    centerInWorld: pP0.add(pP1).divideScalar(2),
+    vecx: pet.vectorX.clone(),
+    vecy: pet.vectorZ.clone().normalize().multiplyScalar(pet.vectorX.length()),
+    vecz: pet.vectorY.clone(),
+    isMip: true,
+    mip: { mipAngle: 0, isSurface: false, thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 },
+  } as VolumeImageBoxInfo;
+  tileN.value = 4;
+  refreshSegStoreVolumeRefs();
+  autoFitMode.value = true;
+  applyAutoFit();
+  await nextTick();
+  if (imb.value) for (const a of imb.value) a.init();
+  show();
+};
+
+// L4 Compare 2-up: 1×2 (同 plane で 2 series 横並び)
+// PT が 2 つ以上あれば PT axial × 2、無ければ CT/PT 並びにフォールバック。
+const setupCompare2up = async () => {
+  // PT 2 つ
+  const ptIdxs: number[] = [];
+  for (let i = 0; i < seriesList.length; i++) {
+    const v = seriesList[i].volume;
+    const m = (v?.metadata?.modality)
+      ?? ((seriesList[i].myDicom?.[0]?.string('x00080060') ?? '').toUpperCase() === 'PT' ? 'PT' : '');
+    if (m === 'PT' || m === 'PET') ptIdxs.push(i);
+  }
+  let leftIdx: number, rightIdx: number, leftDesc: string, rightDesc: string;
+  let leftClut = 1, rightClut = 1;
+  let wcL = { wc: 3, ww: 6 }, wcR = { wc: 3, ww: 6 };
+  if (ptIdxs.length >= 2) {
+    leftIdx = ptIdxs[0]; rightIdx = ptIdxs[1];
+    leftDesc = seriesSummaries.value[leftIdx]?.description ?? 'PT 1';
+    rightDesc = seriesSummaries.value[rightIdx]?.description ?? 'PT 2';
+  } else {
+    // Fallback: CT vs PT
+    let ctIdx = -1, petIdx = -1;
+    for (let i = 0; i < seriesList.length; i++) {
+      const dl = seriesList[i].myDicom;
+      const m = (dl?.[0]?.string('x00080060') ?? '').toUpperCase();
+      if (m === 'CT' && ctIdx < 0) ctIdx = i;
+      if ((m === 'PT' || m === 'PET') && petIdx < 0) petIdx = i;
+    }
+    if (ctIdx < 0 && petIdx < 0) { alert('At least one PT or CT series is required.'); return; }
+    if (ctIdx < 0) { leftIdx = petIdx; rightIdx = petIdx; }
+    else if (petIdx < 0) { leftIdx = ctIdx; rightIdx = ctIdx; leftClut = 0; rightClut = 0; wcL = { wc: 40, ww: 400 }; wcR = wcL; }
+    else { leftIdx = ctIdx; rightIdx = petIdx; leftClut = 0; wcL = { wc: 40, ww: 400 }; }
+    leftDesc = seriesSummaries.value[leftIdx]?.description ?? '';
+    rightDesc = seriesSummaries.value[rightIdx]?.description ?? '';
+  }
+  if (!seriesList[leftIdx].volume)  { if (!mpr_(leftIdx))  return; }
+  if (!seriesList[rightIdx].volume) { if (!mpr_(rightIdx)) return; }
+  imageBoxInfos.value[0] = makeVolumeBoxForPlane(leftIdx,  'axi', leftDesc,  leftClut,  wcL);
+  imageBoxInfos.value[1] = makeVolumeBoxForPlane(rightIdx, 'axi', rightDesc, rightClut, wcR);
+  tileN.value = 2;
+  refreshSegStoreVolumeRefs();
+  autoFitMode.value = true;
+  applyAutoFit();
+  await nextTick();
+  if (imb.value) for (const a of imb.value) a.init();
+  show();
+};
+
 // ===== テスト DICOM 自動オープン =====
 // Chromium 系: showDirectoryPicker() を使い、選んだフォルダのハンドルをセッション中キャッシュ。
 // 一度選べば「Load test DICOM」ボタンで即時再ロード可能。
@@ -1785,12 +2521,39 @@ const fitToWindow = () => {
   applyAutoFit();
 };
 
+// SeriesList でサムネ paging するときに任意 slice のサムネを生成するための provide。
+// SeriesList は seriesList[] や myDicom 配列を直接見られないので、ここからクロージャで提供。
+provide('getThumbnailForSlice', (seriesIdx: number, sliceIdx: number): string | null => {
+  if (seriesIdx < 0 || seriesIdx >= seriesList.length) return null;
+  const s = seriesList[seriesIdx];
+  if (!s) return null;
+  const modality = seriesSummaries.value[seriesIdx]?.modality ?? '-';
+  return generateThumbnail(s, modality, sliceIdx);
+});
+provide('getSliceCount', (seriesIdx: number): number => {
+  if (seriesIdx < 0 || seriesIdx >= seriesList.length) return 0;
+  const s = seriesList[seriesIdx];
+  if (!s) return 0;
+  if (s.volume) return s.volume.nz;
+  if (s.myDicom) return s.myDicom.length;
+  return 0;
+});
+
 defineExpose({
   setupPetStandardView,
+  setupTriplanarPt,
+  setupTriplanarFused,
+  setupPtOnly4up,
+  setupCompare2up,
   loadTestDicom,
   disableAutoFit,
   fitToWindow,
   seriesSummariesPublic: seriesSummaries,
+  fusion,
+  // ★2: JPEG Lossless decompress 進捗を App-bar から参照可能に
+  jpegDecompressInProgress,
+  jpegDecompressDone,
+  jpegDecompressTotal,
 });
 
 </script>
@@ -1812,21 +2575,11 @@ defineExpose({
       @presetSelected="presetSelected"
       @changeSlice="changeSlice_"
       @changeSeries="changeSeries"
-      @selectSeries="onSelectSeriesFromCard"
-      @mpr="mpr(true)"
-      @axi="switchToAxial(true)"
-      @cor="switchToCoronal(true)"
-      @mip="switchToMip(true)"
-      @smip="switchToSMip(true)"
-      @monochrome="switchToMonochrome(true)"
-      @rainbow="switchToRainbow(true)"
-      @hot="switchToHot(true)"
-      @reverse="reverse(true)"
+      @setModality="onSetSeriesModality"
+      @setActiveForSeg="onSetActiveForSeg"
       @phantom1="phantom1"
       @phantom2="phantom2"
       @phantom3="phantom3"
-      @fusion="fusion"
-      @maximize="maximize"
       @redraw="show"
     />
   </v-navigation-drawer>
@@ -1873,10 +2626,25 @@ defineExpose({
         @dblclick="onDblClick"
         @dragenter="dragEnter"
         @dragleave="dragLeave"
-        @dropover.prevent
-        @drop.prevent="dropFile"
+        @dragover.prevent
+        @drop.prevent="(e: DragEvent) => dropFile(e, i-1)"
         :isEnter="isEnter"
         :selected="i-1 === selectedImageBoxId"
+        :modality-label="getBoxModalityLabel(i-1)"
+        :description="getBoxDescription(i-1)"
+        :box-kind="getBoxKind(i-1)"
+        :current-plane="getBoxCurrentPlane(i-1)"
+        :current-clut="getBoxCurrentClut(i-1)"
+        :sync-enabled="isBoxSyncEnabled(i-1)"
+        :global-sync-on="!!syncImageBox"
+        @close-box="onTitlebarClose(i-1)"
+        @reset-view="onTitlebarResetView(i-1)"
+        @set-plane="(p: 'axi'|'cor'|'sag'|'mip'|'smip') => onTitlebarSetPlane(i-1, p)"
+        @set-clut="(c: number) => onTitlebarSetClut(i-1, c)"
+        @toggle-sync="onTitlebarToggleSync(i-1)"
+        @maximize="onTitlebarMaximize(i-1)"
+        @toggle-overlay="onTitlebarToggleOverlay(i-1)"
+        @make-mpr="onTitlebarMakeMpr(i-1)"
       />
     </div>
 

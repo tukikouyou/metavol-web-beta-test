@@ -10,6 +10,7 @@
     "@mdi/font": "6.2.95",
     "@types/axios": "^0.14.0",
     "axios": "^1.7.2",
+    "dcmjs-codecs": "^0.0.8",
     "dicom-parser": "^1.8.21",
     "jpeg-lossless-decoder-js": "^2.1.2",
     "nifti-reader-js": "^0.6.8",

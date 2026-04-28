@@ -61,8 +61,11 @@ export const writeNiftiUint16 = (mask: Uint16Array, pet: Volume): Blob => {
     // slice_duration (132) f32: 0
     // toffset (136) f32: 0
     // glmax/glmin (140,144) i32: 0
-    // descrip (148, 80 bytes)
-    writeAscii(u8, 148, "metavol-web segmentation", 80);
+    // descrip (148, 80 bytes): "metavol|sUID=<short>|<nx>x<ny>x<nz>"
+    // 80B しかないので seriesUID は末尾 24 文字に切り詰める。完全 UID は sidecar JSON に。
+    const uid = (pet.metadata?.seriesUID ?? '').slice(-24);
+    const descrip = `metavol|sUID=${uid}|${nx}x${ny}x${nz}`;
+    writeAscii(u8, 148, descrip, 80);
     // aux_file (228, 24 bytes): empty
     // qform_code (252) i16: 0  (use sform)
     dv.setInt16(252, 0, true);

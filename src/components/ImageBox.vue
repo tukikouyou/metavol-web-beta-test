@@ -10,12 +10,120 @@ import { ref, onMounted} from 'vue';
 import * as THREE from 'three';
 
 
-const prop = defineProps(["width","height","selected","isEnter"]);
+const prop = defineProps<{
+  width: number;
+  height: number;
+  selected: boolean;
+  isEnter: boolean;
+  modalityLabel?: string;
+  description?: string;
+  boxKind?: 'dicom' | 'volume' | 'fusion' | 'mip';
+  currentPlane?: 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | null;
+  currentClut?: number;
+  syncEnabled?: boolean;
+  globalSyncOn?: boolean;
+}>();
+
+const emit = defineEmits<{
+  (e: 'closeBox'): void;
+  (e: 'resetView'): void;
+  (e: 'setPlane', plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip'): void;
+  (e: 'setClut', clutIdx: number): void;
+  (e: 'toggleSync'): void;
+  (e: 'maximize'): void;
+  (e: 'toggleOverlay'): void;
+  (e: 'makeMpr'): void;
+}>();
 
 const isEnter = ref(false);
 
+const planeItems = [
+  { id: 'axi',  label: 'Axial' },
+  { id: 'cor',  label: 'Coronal' },
+  { id: 'sag',  label: 'Sagittal' },
+  { id: 'mip',  label: 'MIP' },
+  { id: 'smip', label: 'sMIP' },
+] as const;
+
+// CLUT id は DicomView 側の switchTo* と一致 (Mono=0, Rainbow=2, Hot=4)。
+// 'Reverse' は同色の反転 LUT へトグル (DicomView 側で id=-1 を sentinel として処理)。
+const clutItems = [
+  { id: 0,  label: 'Mono' },
+  { id: 4,  label: 'Hot' },
+  { id: 2,  label: 'Rainbow' },
+  { id: -1, label: 'Reverse' },
+] as const;
+
+// 現在 CLUT のハイライト判定: 反転 LUT (奇数値) は対応する偶数 LUT を active 表示。
+const isClutActive = (itemId: number): boolean => {
+  if (prop.currentClut == null) return false;
+  if (itemId === -1) return false;
+  return (prop.currentClut & ~1) === itemId;
+};
+
+const modalityChipColor = (m?: string): string => {
+  const u = (m ?? '').toUpperCase();
+  if (u === 'PT' || u === 'PET') return '#ff9b3a';
+  if (u === 'CT') return '#7ad0ff';
+  if (u === 'MR') return '#a78bfa';
+  if (u === 'FUSED') return '#ffd24a';
+  if (u === 'MIP')   return '#c9a0ff';
+  if (u === '2D')    return '#666';
+  return '#888';
+};
+
+const isVolumeKind = (): boolean => prop.boxKind === 'volume' || prop.boxKind === 'fusion' || prop.boxKind === 'mip';
+
+const onSavePngLocal = () => {
+  if (!cv1.value) return;
+  const url = cv1.value.toDataURL('image/png');
+  const a = document.createElement('a');
+  a.href = url;
+  const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+  a.download = `metavol-${ts}.png`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+};
+
 const cv1 = ref<HTMLCanvasElement | null>(null);
 let ctx: CanvasRenderingContext2D | null = null;
+
+// 3D volume を fractional voxel 座標で trilinear sampling する。
+// 範囲外なら null を返す (caller が背景値で埋める想定)。
+// 主に Fusion box の PET layer 用 (低解像 PET → 高解像 CT 上に重ねるとき
+// nearest だとブロック状になるのを滑らかにする)。
+const sampleTrilinear = (
+    pix: Float32Array | Int16Array,
+    nx: number, ny: number, nz: number,
+    vx: number, vy: number, vz: number,
+): number | null => {
+    if (vx < 0 || vy < 0 || vz < 0 || vx >= nx || vy >= ny || vz >= nz) return null;
+    const x0 = Math.floor(vx); const x1 = x0 + 1 < nx ? x0 + 1 : x0; const fx = vx - x0;
+    const y0 = Math.floor(vy); const y1 = y0 + 1 < ny ? y0 + 1 : y0; const fy = vy - y0;
+    const z0 = Math.floor(vz); const z1 = z0 + 1 < nz ? z0 + 1 : z0; const fz = vz - z0;
+    const nxny = nx * ny;
+    const c000 = pix[z0 * nxny + y0 * nx + x0];
+    const c100 = pix[z0 * nxny + y0 * nx + x1];
+    const c010 = pix[z0 * nxny + y1 * nx + x0];
+    const c110 = pix[z0 * nxny + y1 * nx + x1];
+    const c001 = pix[z1 * nxny + y0 * nx + x0];
+    const c101 = pix[z1 * nxny + y0 * nx + x1];
+    const c011 = pix[z1 * nxny + y1 * nx + x0];
+    const c111 = pix[z1 * nxny + y1 * nx + x1];
+    const c00 = c000 + (c100 - c000) * fx;
+    const c10 = c010 + (c110 - c010) * fx;
+    const c01 = c001 + (c101 - c001) * fx;
+    const c11 = c011 + (c111 - c011) * fx;
+    const c0 = c00 + (c10 - c00) * fy;
+    const c1 = c01 + (c11 - c01) * fy;
+    return c0 + (c1 - c0) * fz;
+};
+
+// Canvas が「空」(まだ画像未描画 / clear() 直後) かどうか。
+// HTML overlay の empty state を表示制御する ref。
+const isEmpty = ref(true);
+const emptyText = ref('No image');
 
 const init = () => {
   if (cv1.value === null) {
@@ -30,18 +138,22 @@ onMounted(() => {
 });
 
 const show = (ppp: Float32Array | Int16Array, cols: number, rows: number, wc: number, ww: number, intercept: number, slope: number, centerX:number, centerY:number, zoom: number) => {
+    isEmpty.value = false;
     drawImageCvZoom(ppp, cols, rows, wc, ww, intercept, slope, centerX, centerY, zoom);
 }
 
 const showDirect = (ppp: Float32Array | Int16Array, wc: number, ww: number) => {
+    isEmpty.value = false;
     drawImageCvDirect(ppp, wc, ww);
 }
 
 const show2 = (ppp: Float32Array, qqq: Float32Array, cols: number, rows: number, wc: number, ww: number, wc2: number, ww2: number, intercept: number, slope: number, centerX:number, centerY:number, zoom: number) => {
+    isEmpty.value = false;
     drawImageCv2(ppp, qqq, cols, rows, wc, ww, wc2, ww2, intercept, slope, centerX, centerY, zoom);
 }
 
 const showRgb = (ppp: Uint8Array, cols: number, rows: number, centerX:number, centerY:number, zoom: number) => {
+    isEmpty.value = false;
     drawImageCvRgb(ppp, cols, rows, centerX, centerY, zoom);
 }
 
@@ -74,8 +186,8 @@ const drawImageCvZoom = async function(pix: Float32Array | Int16Array, ny:number
     }
   }
   ctx.putImageData(myImageData, 0,0,0,0,canvasx, canvasy);
-  showTextTopRight("2D");
-  showTextBottomLeft(`WC:${wc}/WW:${ww}`);
+  // canvas-baked label / status は title bar に移行済みのため非表示
+  void wc; void ww;
 
 }
 
@@ -119,6 +231,7 @@ const drawNiftiSlice = async function(pix: Float32Array | Int16Array,
     overlay?: MaskOverlay) {
 
       if (cv1.value === null || ctx === null) return;
+      isEmpty.value = false;
       const canvasx = cv1.value.width;
       const canvasy = cv1.value.height;
       const myImageData = ctx.getImageData(0,0,canvasx,canvasy); // メモリーを新たに確保しないので、createImageDataよりも有利だと思う（想像）
@@ -129,9 +242,10 @@ const drawNiftiSlice = async function(pix: Float32Array | Int16Array,
         const vm = overlay ? overlay.p00.clone().addScaledVector(overlay.v01, i) : null;
         for (let j = 0; j<canvasx; j++){
 
-          const v0 = v.clone().floor();
-          if (v0.x>=0 && v0.x<nx && v0.y>=0 && v0.y<ny && v0.z>=0 && v0.z<nz){
-            const raw = pix[ny*nx*v0.z+nx*v0.y+v0.x];
+          // trilinear sampling: 低解像 PET を高解像 box に表示するときに滑らか。
+          // 範囲外なら null を返し、既存の clut[0] フォールバックを使う。
+          const raw = sampleTrilinear(pix, nx, ny, nz, v.x, v.y, v.z);
+          if (raw != null){
             let p = Math.floor((raw-(wc-ww/2)) * (255/ww));
             if (p<0) p=0;
             if (p>255) p=255;
@@ -165,7 +279,6 @@ const drawNiftiSlice = async function(pix: Float32Array | Int16Array,
       }
 
   ctx.putImageData(myImageData, 0,0,0,0,canvasx, canvasy);
-  showTextTopRight("3D");
 }
 
 const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
@@ -178,6 +291,7 @@ const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
   ) {
 
       if (cv1.value === null || ctx === null) return;
+      isEmpty.value = false;
       const canvasx = cv1.value.width;
       const canvasy = cv1.value.height;
       const myImageData = ctx.getImageData(0,0,canvasx,canvasy); // メモリーを新たに確保しないので、createImageDataよりも有利だと思う（想像）
@@ -206,9 +320,10 @@ const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
             myImageData.data[ad+2] = clut0[0][2] * 0.5;
           }
 
-          if (v0_1.x >= 0 && v0_1.x < nx1 && v0_1.y >= 0 && v0_1.y < ny1 && v0_1.z >= 0 && v0_1.z < nz1){
-            const raw = pix1[ny1*nx1*v0_1.z+nx1*v0_1.y+v0_1.x];
-            let p = Math.floor((raw-(wc1-ww1/2)) * (255/ww1));
+          // PET layer: trilinear sampling (低解像 PET を CT 上に重ねるときに滑らか)
+          const rawPet = sampleTrilinear(pix1, nx1, ny1, nz1, v_1.x, v_1.y, v_1.z);
+          if (rawPet != null){
+            let p = Math.floor((rawPet-(wc1-ww1/2)) * (255/ww1));
             if (p<0) p=0;
             if (p>255) p=255;
             myImageData.data[ad] += clut1[p][0] * 0.5; //red
@@ -242,7 +357,6 @@ const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
       }
 
   ctx.putImageData(myImageData, 0,0,0,0,canvasx, canvasy);
-  showTextTopRight("Fused");
 }
 
 // let mipDataSet: Float32Array[] = new Float32Array[];
@@ -256,6 +370,7 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
       const time0 = performance.now();
 
       if (cv1.value === null || ctx === null) return;
+      isEmpty.value = false;
       const canvasx = cv1.value.width;
       const canvasy = cv1.value.height;
       const myImageData = ctx.getImageData(0,0,canvasx,canvasy);
@@ -389,13 +504,7 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
   const time4 = performance.now();
   // console.log(time1-time0, time2-time1, time3-time2, time4-time3);
 
-  if (isSurface){
-    showTextTopRight("sMIP");
-  }else{
-    showTextTopRight("MIP");
-  }
-
-
+  void isSurface;
 }
 
 
@@ -523,7 +632,6 @@ const drawImageCvRgb = async function(pix:Uint8Array, ny:number, nx:number, shif
     }
   }
   ctx.putImageData(myImageData, 0,0,0,0,canvasx, canvasy);
-  showTextTopRight("RGB");
 }
 
 
@@ -534,29 +642,10 @@ const clear = (text = "No image") => {
   ctx.fillStyle = "#000000";
   ctx.fillRect(0,0,cv1.value.width, cv1.value.height);
 
-  ctx.font = "48px Arial";
-  ctx.fillStyle = "#660505";
-  ctx.fillText(text,20,50);
+  // テキストは canvas に焼き込まず、HTML overlay (mv-empty-state) で表示する
+  isEmpty.value = true;
+  emptyText.value = text;
 }
-
-const showTextTopRight = (text: string) => {
-  if (cv1.value === null || ctx === null) return;
-  ctx.font = "18px Arial";
-  ctx.fillStyle = "#66aa44";
-  const mes = ctx.measureText(text);
-  
-  ctx.fillText(text, cv1.value.width-mes.width, mes.fontBoundingBoxAscent);
-}
-
-const showTextBottomLeft = (text: string) => {
-  if (cv1.value === null || ctx === null) return;
-  ctx.font = "18px Arial";
-  ctx.fillStyle = "#66aa44";
-  const mes = ctx.measureText(text);
-  
-  ctx.fillText(text, 0, cv1.value.height - mes.fontBoundingBoxDescent );
-}
-
 
 const drawSphereOverlay = (cx: number, cy: number, radiusPx: number) => {
   if (cv1.value === null || ctx === null) return;
@@ -604,30 +693,225 @@ defineExpose({init, show, show2, showRgb, showDirect,
 
 
 <template>
-    <div class = "drop_area"
+    <div class="drop_area mv-box"
         @dragover.prevent
-        :class="{enter: isEnter}">
-        <span>
-            <canvas ref="cv1" :width="prop.width" :height="prop.height"
-             :class="[prop.selected ? 'selectedStyle' : 'unselectedStyle', prop.isEnter ? 'isEnter' : '']">
+        :class="{enter: isEnter, 'is-selected': prop.selected, 'is-enter-style': prop.isEnter}">
+        <div class="mv-titlebar"
+             @click.stop
+             @dblclick="emit('maximize')">
+            <span class="mv-mod-chip"
+                  :style="{ background: modalityChipColor(prop.modalityLabel) }">
+                {{ (prop.modalityLabel || '??').toUpperCase() }}
+            </span>
+            <span class="mv-desc" :title="prop.description ?? ''">
+                {{ prop.description ?? '' }}
+            </span>
+
+            <span class="mv-titlebar-actions" @dblclick.stop>
+                <v-menu v-if="isVolumeKind()" location="bottom end">
+                    <template v-slot:activator="{ props: act }">
+                        <v-btn v-bind="act" icon variant="text" size="x-small" class="mv-tb-btn">
+                            <v-icon icon="mdi-axis-arrow" size="small" />
+                            <v-tooltip activator="parent" location="bottom">Plane / View</v-tooltip>
+                        </v-btn>
+                    </template>
+                    <v-list density="compact">
+                        <v-list-item v-for="p in planeItems" :key="p.id"
+                                     :active="prop.currentPlane === p.id"
+                                     @click="emit('setPlane', p.id)">
+                            <v-list-item-title>{{ p.label }}</v-list-item-title>
+                        </v-list-item>
+                    </v-list>
+                </v-menu>
+
+                <v-menu v-if="isVolumeKind()" location="bottom end">
+                    <template v-slot:activator="{ props: act }">
+                        <v-btn v-bind="act" icon variant="text" size="x-small" class="mv-tb-btn">
+                            <v-icon icon="mdi-palette" size="small" />
+                            <v-tooltip activator="parent" location="bottom">Color (CLUT)</v-tooltip>
+                        </v-btn>
+                    </template>
+                    <v-list density="compact">
+                        <v-list-item v-for="c in clutItems" :key="c.id"
+                                     :active="isClutActive(c.id)"
+                                     @click="emit('setClut', c.id)">
+                            <v-list-item-title>{{ c.label }}</v-list-item-title>
+                        </v-list-item>
+                    </v-list>
+                </v-menu>
+
+                <v-btn icon variant="text" size="x-small" class="mv-tb-btn"
+                       @click="emit('resetView')">
+                    <v-icon icon="mdi-restart" size="small" />
+                    <v-tooltip activator="parent" location="bottom">Reset W/L &amp; view</v-tooltip>
+                </v-btn>
+
+                <v-btn v-if="prop.globalSyncOn"
+                       icon variant="text" size="x-small"
+                       :class="['mv-tb-btn', { 'is-on': prop.syncEnabled, 'is-off': !prop.syncEnabled }]"
+                       @click="emit('toggleSync')">
+                    <v-icon :icon="prop.syncEnabled ? 'mdi-link-variant' : 'mdi-link-variant-off'" size="small" />
+                    <v-tooltip activator="parent" location="bottom">
+                        {{ prop.syncEnabled ? 'Sync ON for this box (click to detach)' : 'Sync OFF for this box (click to attach)' }}
+                    </v-tooltip>
+                </v-btn>
+
+                <v-btn icon variant="text" size="x-small" class="mv-tb-btn"
+                       @click="emit('maximize')">
+                    <v-icon icon="mdi-arrow-expand" size="small" />
+                    <v-tooltip activator="parent" location="bottom">Maximize / Restore</v-tooltip>
+                </v-btn>
+
+                <v-menu location="bottom end">
+                    <template v-slot:activator="{ props: act }">
+                        <v-btn v-bind="act" icon variant="text" size="x-small" class="mv-tb-btn">
+                            <v-icon icon="mdi-dots-horizontal" size="small" />
+                            <v-tooltip activator="parent" location="bottom">More</v-tooltip>
+                        </v-btn>
+                    </template>
+                    <v-list density="compact">
+                        <v-list-item @click="onSavePngLocal">
+                            <v-list-item-title>Save PNG</v-list-item-title>
+                        </v-list-item>
+                        <v-list-item @click="emit('toggleOverlay')">
+                            <v-list-item-title>Toggle mask overlay</v-list-item-title>
+                        </v-list-item>
+                        <v-list-item v-if="prop.boxKind === 'dicom'" @click="emit('makeMpr')">
+                            <v-list-item-title>Make MPR (this box)</v-list-item-title>
+                        </v-list-item>
+                    </v-list>
+                </v-menu>
+
+                <v-btn icon variant="text" size="x-small" class="mv-tb-btn mv-tb-close"
+                       @click="emit('closeBox')">
+                    <v-icon icon="mdi-close" size="small" />
+                    <v-tooltip activator="parent" location="bottom">Close this box</v-tooltip>
+                </v-btn>
+            </span>
+        </div>
+
+        <div class="mv-canvas-wrap">
+            <canvas ref="cv1" :width="prop.width" :height="prop.height" class="mv-canvas">
             </canvas>
-        </span>
+            <div v-if="isEmpty" class="mv-empty-state">
+                <v-icon icon="mdi-image-off-outline" size="48" />
+                <span>{{ emptyText }}</span>
+            </div>
+        </div>
     </div>
 
 </template>
 
 <style scoped>
 
-.unselectedStyle{
-  border: 3px solid #444 
+/* OHIF v3 風: subtle border, accent ring on select, no chunky frame. */
+.mv-box {
+  display: flex;
+  flex-direction: column;
+  background: var(--mv-bg, #0F1419);
 }
 
-.selectedStyle{
-  border: 3px solid #a44
+.mv-titlebar {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 6px;
+  background: var(--mv-surface-2, #222B36);
+  border-bottom: 1px solid var(--mv-border, #2A3441);
+  font-size: 11px;
+  color: var(--mv-text, #E8EEF2);
+  gap: 8px;
+  user-select: none;
+  flex-shrink: 0;
+  transition: border-color 0.15s, background 0.15s;
+}
+.mv-box.is-selected .mv-titlebar {
+  background: linear-gradient(180deg, rgba(0,212,170,0.06) 0%, var(--mv-surface-2, #222B36) 100%);
+  border-bottom-color: var(--mv-accent, #00D4AA);
 }
 
-.isEnter{
-  border: 3px solid #4a4
+/* Modality chip: pill shape, slight inner highlight for depth */
+.mv-mod-chip {
+  color: #0F1419;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 3px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  flex-shrink: 0;
+  line-height: 1.4;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.18),
+    0 1px 1px rgba(0,0,0,0.18);
+}
+
+.mv-desc {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--mv-text-dim, #8FA0B0);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.mv-titlebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  flex-shrink: 0;
+}
+
+.mv-tb-btn {
+  width: 24px !important;
+  height: 24px !important;
+  min-width: 24px !important;
+  color: var(--mv-text-muted, #5A6877);
+  transition: color 0.12s;
+}
+.mv-tb-btn:hover {
+  color: var(--mv-accent, #00D4AA);
+}
+.mv-tb-btn.is-on {
+  color: var(--mv-accent, #00D4AA);
+}
+.mv-tb-btn.is-off {
+  color: var(--mv-text-muted, #5A6877);
+}
+.mv-tb-close:hover {
+  color: var(--mv-error, #FF5C7A);
+}
+
+/* Canvas + empty state overlay container */
+.mv-canvas-wrap {
+  position: relative;
+  display: flex;
+  background: #000;
+  flex: 1 1 auto;
+}
+.mv-canvas {
+  display: block;
+}
+
+/* Empty state: centered icon + dim caption */
+.mv-empty-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--mv-text-muted, #5A6877);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  user-select: none;
+}
+.mv-empty-state :deep(.v-icon) {
+  opacity: 0.35;
 }
 
 </style>

@@ -33,21 +33,22 @@
 
       <v-spacer />
 
-      <v-btn
-        class="mv-tool-btn mv-tool-btn--wide mr-1"
-        variant="text"
-        size="small"
-        @click="loadTestDicom"
-      >
-        <v-icon icon="mdi-folder-open-outline" />
-        <span class="mv-tool-label">Test</span>
-        <v-tooltip activator="parent" location="bottom">
-          Pick a folder to load test DICOM (no re-pick needed within the same session)
-        </v-tooltip>
-      </v-btn>
+      <!-- JPEG Lossless decompress progress (★2) -->
+      <div v-if="jpegProgress.inProgress" class="mv-jpeg-progress mr-2">
+        <v-icon icon="mdi-package-variant" size="x-small" class="mr-1" />
+        <span class="mv-jpeg-progress-label">
+          Decompressing JPEG Lossless… {{ jpegProgress.done }} / {{ jpegProgress.total }}
+        </span>
+        <v-progress-linear
+          :model-value="jpegProgress.percent"
+          height="3"
+          color="primary"
+          class="mv-jpeg-progress-bar"
+        />
+      </div>
 
       <v-btn
-        class="mv-pet-std-btn mr-2"
+        class="mv-pet-std-btn mr-1"
         variant="flat"
         size="small"
         :disabled="!petCtReady"
@@ -57,6 +58,65 @@
         PET Standard
         <v-tooltip activator="parent" location="bottom">
           {{ petCtReady ? '2x2: CT axi / PET axi / Fusion axi / PET MIP' : 'Load both PET and CT first' }}
+        </v-tooltip>
+      </v-btn>
+
+      <v-menu>
+        <template v-slot:activator="{ props: act }">
+          <v-btn
+            v-bind="act"
+            class="mv-tool-btn mv-tool-btn--wide mr-1"
+            variant="text"
+            size="small"
+          >
+            <v-icon icon="mdi-view-dashboard-outline" />
+            <span class="mv-tool-label">Layouts</span>
+            <v-tooltip activator="parent" location="bottom">More layout presets</v-tooltip>
+          </v-btn>
+        </template>
+        <v-list density="compact">
+          <v-list-item @click="runLayout('triplanarPt')">
+            <template v-slot:prepend>
+              <v-icon icon="mdi-view-week-outline" size="small" />
+            </template>
+            <v-list-item-title>Triplanar PT (1×3)</v-list-item-title>
+            <v-list-item-subtitle>PT axial / coronal / sagittal</v-list-item-subtitle>
+          </v-list-item>
+          <v-list-item @click="runLayout('triplanarFused')">
+            <template v-slot:prepend>
+              <v-icon icon="mdi-view-week" size="small" />
+            </template>
+            <v-list-item-title>Triplanar Fused (1×3)</v-list-item-title>
+            <v-list-item-subtitle>Fused axial / coronal / sagittal</v-list-item-subtitle>
+          </v-list-item>
+          <v-list-item @click="runLayout('ptOnly4up')">
+            <template v-slot:prepend>
+              <v-icon icon="mdi-view-grid" size="small" />
+            </template>
+            <v-list-item-title>PT-only 4-up (2×2)</v-list-item-title>
+            <v-list-item-subtitle>PT axi / cor / sag / MIP</v-list-item-subtitle>
+          </v-list-item>
+          <v-list-item @click="runLayout('compare2up')">
+            <template v-slot:prepend>
+              <v-icon icon="mdi-compare" size="small" />
+            </template>
+            <v-list-item-title>Compare 2-up (1×2)</v-list-item-title>
+            <v-list-item-subtitle>Two series side-by-side, same plane</v-list-item-subtitle>
+          </v-list-item>
+        </v-list>
+      </v-menu>
+
+      <v-btn
+        class="mv-tool-btn mv-tool-btn--wide mr-2"
+        variant="text"
+        size="small"
+        :disabled="!petCtReady"
+        @click="runFusion"
+      >
+        <v-icon icon="mdi-circle-multiple-outline" />
+        <span class="mv-tool-label">Fusion</span>
+        <v-tooltip activator="parent" location="bottom">
+          {{ petCtReady ? 'Fuse CT (base) + PET (overlay) into the active box' : 'Load both PET and CT first' }}
         </v-tooltip>
       </v-btn>
 
@@ -143,7 +203,7 @@
         v-model:inspector="drawerRight"
         v-model:leftButtonFunction="leftButtonFunction"
         v-model:imageBoxW="imageBoxW"
-        v-model:imageBoxH="imageBoxW"
+        v-model:imageBoxH="imageBoxH"
         v-model:tileN="tileN"
         v-model:syncImageBox="syncImageBox"
         v-model:closingImages="closingImages"
@@ -153,10 +213,20 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import DicomView from "./components/DicomView.vue";
 import { getWH, getTileN } from "./components/UrlParser.ts";
 import { useSegmentationStore } from "./stores/segmentation";
+import { ensureWasmCodecsReady } from "./components/wasmCodec";
+
+// アプリ起動時に dcmjs-codecs WASM をプリウォーム (DICOM JPEG Lossless 用)。
+// ~4 MB の WASM を fetch + instantiate するので体感 0.3-1s かかる。
+// バックグラウンドで進行、失敗時は jpeg-lossless-decoder-js (純 JS) にフォールバック。
+onMounted(() => {
+  ensureWasmCodecsReady().catch(err => {
+    console.warn('[wasm-codecs] init failed (will fall back to pure JS for JPEG Lossless):', err);
+  });
+});
 
 const segStore = useSegmentationStore();
 
@@ -193,12 +263,16 @@ const tools = [
 ];
 
 const changeImageBoxSize = (d: number) => {
-  let a = imageBoxH.value;
-  a += d;
-  if (a < 100) a = 100;
-  if (a > 1000) a = 1000;
-  imageBoxH.value = a;
-  imageBoxW.value = a;
+  // 現在のアスペクト比を保持したまま縦サイズを d だけ増減 (横は比例変化)
+  const curH = imageBoxH.value || 1;
+  const curW = imageBoxW.value || 1;
+  const ratio = curW / curH;
+  let h = curH + d;
+  if (h < 100) h = 100;
+  if (h > 1500) h = 1500;
+  const w = Math.max(100, Math.round(h * ratio));
+  imageBoxH.value = h;
+  imageBoxW.value = w;
   // 手動サイズ変更で autoFit を解除
   dicomViewRef.value?.disableAutoFit?.();
 };
@@ -219,9 +293,28 @@ const petStandardView = () => {
   }, 50);
 };
 
-const loadTestDicom = () => {
-  dicomViewRef.value?.loadTestDicom?.();
+const runFusion = () => {
+  dicomViewRef.value?.fusion?.();
 };
+
+const runLayout = (kind: 'triplanarPt' | 'triplanarFused' | 'ptOnly4up' | 'compare2up') => {
+  const r = dicomViewRef.value;
+  if (!r) return;
+  if (kind === 'triplanarPt')   r.setupTriplanarPt?.();
+  if (kind === 'triplanarFused') r.setupTriplanarFused?.();
+  if (kind === 'ptOnly4up')     r.setupPtOnly4up?.();
+  if (kind === 'compare2up')    r.setupCompare2up?.();
+};
+
+// ★2: JPEG Lossless decompress 進捗を app-bar に表示
+const jpegProgress = computed(() => {
+  const r = dicomViewRef.value;
+  const inProgress = !!r?.jpegDecompressInProgress;
+  const done = (r?.jpegDecompressDone as number) ?? 0;
+  const total = (r?.jpegDecompressTotal as number) ?? 0;
+  const percent = total > 0 ? (done / total) * 100 : 0;
+  return { inProgress, done, total, percent };
+});
 </script>
 
 <style scoped>
@@ -267,5 +360,33 @@ const loadTestDicom = () => {
 
 :deep(.v-app-bar) {
   border-bottom: 1px solid var(--mv-border);
+}
+
+/* ★2: JPEG Lossless decompress progress chip — pulse animation で「作業中」を強調 */
+@keyframes mv-pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 212, 170, 0.45); }
+  50%      { box-shadow: 0 0 8px 2px rgba(0, 212, 170, 0.55); }
+}
+.mv-jpeg-progress {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  padding: 4px 12px;
+  background: var(--mv-surface-2, #222B36);
+  border: 1px solid var(--mv-accent-dim, #007E66);
+  border-radius: 6px;
+  min-width: 240px;
+  animation: mv-pulse-glow 1.6s ease-in-out infinite;
+}
+.mv-jpeg-progress-label {
+  font-size: 11px;
+  color: var(--mv-accent, #00D4AA);
+  font-feature-settings: 'tnum';
+  white-space: nowrap;
+  font-weight: 600;
+}
+.mv-jpeg-progress-bar {
+  border-radius: 2px;
 }
 </style>

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { useSegmentationStore } from '../stores/segmentation';
+import { readNiftiMask } from './segmentation/niftiReader';
 
 const store = useSegmentationStore();
 
@@ -150,6 +151,88 @@ const onSave = () => {
     store.saveMaskAsNifti();
 };
 
+const loadFileInput = ref<HTMLInputElement | null>(null);
+
+const onLoadMaskClick = () => {
+    loadFileInput.value?.click();
+};
+
+const readFileAsArrayBuffer = (f: File): Promise<ArrayBuffer> =>
+    new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onerror = () => reject(new Error(`Failed to read ${f.name}`));
+        r.onload = () => resolve(r.result as ArrayBuffer);
+        r.readAsArrayBuffer(f);
+    });
+
+const readFileAsText = (f: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onerror = () => reject(new Error(`Failed to read ${f.name}`));
+        r.onload = () => resolve(r.result as string);
+        r.readAsText(f);
+    });
+
+const onLoadMaskFiles = async (e: Event) => {
+    const input = e.target as HTMLInputElement;
+    const files = Array.from(input.files ?? []);
+    input.value = '';
+    if (files.length === 0) return;
+
+    if (!store.hasPet) {
+        alert('Load a PET volume first, then load the mask.');
+        return;
+    }
+
+    const niiFile = files.find(f => /\.nii(\.gz)?$/i.test(f.name));
+    const jsonFile = files.find(f => /\.json$/i.test(f.name));
+
+    if (!niiFile) {
+        alert('Please select a .nii or .nii.gz mask file.');
+        return;
+    }
+
+    try {
+        const buf = await readFileAsArrayBuffer(niiFile);
+        const parsed = readNiftiMask(buf);
+
+        let sidecar:
+            | { threshold?: number; thresholdUnit?: 'SUV' | 'CNTS'; labels?: any[]; petMetadata?: { seriesUID?: string; seriesDescription?: string } }
+            | null = null;
+        if (jsonFile) {
+            try {
+                const text = await readFileAsText(jsonFile);
+                sidecar = JSON.parse(text);
+            } catch {
+                alert(`Could not parse sidecar JSON ${jsonFile.name}. Mask will still be loaded.`);
+            }
+        }
+
+        // ★4: sidecar に PT seriesUID があり、現在 PT の seriesUID と異なる場合は警告。
+        const sidecarUid = sidecar?.petMetadata?.seriesUID;
+        const currentUid = store.petVolumeRef?.metadata?.seriesUID;
+        if (sidecarUid && currentUid && sidecarUid !== currentUid) {
+            const sidecarDesc = sidecar?.petMetadata?.seriesDescription ?? sidecarUid;
+            const currentDesc = store.petVolumeRef?.metadata?.seriesDescription ?? currentUid;
+            const ok = window.confirm(
+                `This mask was created for PT series:\n  ${sidecarDesc}\n\n` +
+                `but the currently active PT is:\n  ${currentDesc}\n\n` +
+                `The geometry (dims/voxel size) may match by coincidence, but the mask may not align anatomically. Load anyway?`
+            );
+            if (!ok) return;
+        }
+
+        const res = store.loadMaskFromNifti(parsed.mask, parsed.dims, sidecar);
+        if (!res.ok) {
+            alert(res.reason);
+            return;
+        }
+        emit('redraw');
+    } catch (err: any) {
+        alert(`Failed to load mask: ${err?.message ?? err}`);
+    }
+};
+
 const polygonModeProxy = computed({
     get: () => store.polygon?.mode ?? store.defaultPolygonMode,
     set: (m: 'add' | 'erase') => {
@@ -167,9 +250,21 @@ const polygonModeProxy = computed({
         </div>
 
         <template v-else>
+            <!-- Linked PT info: ★4 -->
+            <div v-if="store.petVolumeRef" class="mv-linked-pt">
+                <v-icon icon="mdi-link-variant" size="x-small" class="mr-1" />
+                <span class="mv-linked-pt-label">Linked PT:</span>
+                <span class="mv-linked-pt-name" :title="store.petVolumeRef.metadata?.seriesUID ?? ''">
+                    {{ store.petVolumeRef.metadata?.seriesDescription ?? '(no description)' }}
+                </span>
+            </div>
+
             <!-- Threshold -->
             <section class="mv-section">
-                <div class="mv-section-title">Threshold ({{ store.thresholdUnit }})</div>
+                <div class="mv-section-title">
+                    <v-icon icon="mdi-tune-variant" size="x-small" />
+                    Threshold ({{ store.thresholdUnit }})
+                </div>
                 <v-select
                     :model-value="thresholdSelection"
                     @update:model-value="onThresholdSelectionChange($event)"
@@ -199,7 +294,10 @@ const polygonModeProxy = computed({
 
             <!-- Overlay -->
             <section class="mv-section">
-                <div class="mv-section-title">Overlay</div>
+                <div class="mv-section-title">
+                    <v-icon icon="mdi-layers-outline" size="x-small" />
+                    Overlay
+                </div>
                 <v-switch
                     :model-value="store.overlayEnabled"
                     @update:model-value="onToggleOverlay($event as boolean)"
@@ -225,7 +323,10 @@ const polygonModeProxy = computed({
 
             <!-- Sphere ROI -->
             <section class="mv-section">
-                <div class="mv-section-title">Sphere ROI</div>
+                <div class="mv-section-title">
+                    <v-icon icon="mdi-circle-outline" size="x-small" />
+                    Sphere ROI
+                </div>
                 <div v-if="store.sphere" class="mv-stats">
                     <div class="mv-stat-row">
                         <span class="mv-stat-label">radius</span>
@@ -258,7 +359,10 @@ const polygonModeProxy = computed({
 
             <!-- Polygon ROI -->
             <section class="mv-section">
-                <div class="mv-section-title">Polygon ROI</div>
+                <div class="mv-section-title">
+                    <v-icon icon="mdi-vector-polygon" size="x-small" />
+                    Polygon ROI
+                </div>
                 <v-btn-toggle
                     v-model="polygonModeProxy"
                     density="compact"
@@ -282,7 +386,10 @@ const polygonModeProxy = computed({
 
             <!-- Labels -->
             <section class="mv-section">
-                <div class="mv-section-title">Labels</div>
+                <div class="mv-section-title">
+                    <v-icon icon="mdi-tag-multiple-outline" size="x-small" />
+                    Labels
+                </div>
                 <div class="mv-label-list">
                     <div
                         v-for="row in labelRows"
@@ -322,6 +429,7 @@ const polygonModeProxy = computed({
             <!-- Histogram (per label) -->
             <section class="mv-section">
                 <div class="mv-section-title">
+                    <v-icon icon="mdi-chart-bar" size="x-small" />
                     Histogram — PET ({{ store.thresholdUnit }})
                     <span v-if="currentLabel" class="mv-hist-label-name" :style="{ color: currentLabelColorCss }">
                         {{ currentLabel.name }}
@@ -384,7 +492,10 @@ const polygonModeProxy = computed({
 
             <!-- Islands -->
             <section class="mv-section">
-                <div class="mv-section-title">Islands</div>
+                <div class="mv-section-title">
+                    <v-icon icon="mdi-island" size="x-small" />
+                    Islands
+                </div>
                 <div v-if="store.componentMapValid" class="mv-hint">
                     <span class="mv-accent">{{ store.componentCount }}</span> components detected —
                     click an island with the Assign Label tool
@@ -406,14 +517,25 @@ const polygonModeProxy = computed({
                 </v-btn>
             </section>
 
-            <!-- Save / Clean -->
+            <!-- Save / Load / Clean -->
             <section class="mv-section">
                 <div class="mv-btn-row">
                     <v-btn size="small" color="primary" variant="flat" @click="onSave">
                         <v-icon icon="mdi-content-save" size="small" class="mr-1" />Save NIfTI
                     </v-btn>
+                    <v-btn size="small" variant="tonal" @click="onLoadMaskClick">
+                        <v-icon icon="mdi-folder-open" size="small" class="mr-1" />Load Mask
+                    </v-btn>
                     <v-btn size="small" variant="outlined" @click="onClearManual">Clear edits</v-btn>
                 </div>
+                <input
+                    ref="loadFileInput"
+                    type="file"
+                    accept=".nii,.nii.gz,.json,application/octet-stream,application/json"
+                    multiple
+                    style="display: none"
+                    @change="onLoadMaskFiles"
+                />
             </section>
         </template>
     </div>
@@ -430,6 +552,30 @@ const polygonModeProxy = computed({
     font-size: 12px;
     line-height: 1.5;
     border-bottom: 1px solid var(--mv-border);
+}
+
+/* ★4: Linked PT 表示 */
+.mv-linked-pt {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 12px;
+    background: rgba(0, 212, 170, 0.06);
+    border-bottom: 1px solid var(--mv-border);
+    font-size: 11px;
+    color: var(--mv-text-dim);
+}
+.mv-linked-pt-label {
+    color: var(--mv-text-muted);
+}
+.mv-linked-pt-name {
+    color: var(--mv-accent);
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 .mv-section {

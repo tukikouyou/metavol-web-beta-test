@@ -6,9 +6,10 @@ import { DataSet } from "dicom-parser";
 import * as THREE from 'three';
 import { Volume } from "./Volume";
 import type { VolumeMetadata, Modality } from "../types/VolumeMetadata";
+import * as DecompressJpegLossless from "./decompressJpegLossless";
 
 interface MyDataSet extends DataSet {
-    decompressed: ArrayBuffer;
+    decompressed?: ArrayBuffer;
   }
 
 const detectModality = (d: MyDataSet): Modality => {
@@ -83,12 +84,20 @@ export const generateVolumeFromDicom = (dcmList: MyDataSet[]) => {
         const pixelDataElement = dataSet.elements.x7fe00010;
         const intercept = Number(dataSet.string("x00281052") ?? "0");
         const slope = Number(dataSet.string("x00281053") ?? "1");
-        const aaa = new Int16Array(
-            dataSet.byteArray.buffer,
-            pixelDataElement.dataOffset,
-            pixelDataElement.length / 2
-          );
-        
+
+        // JPEG Lossless 圧縮なら decompress (キャッシュ済みなら再利用)
+        if (DecompressJpegLossless.check(dataSet) && dataSet.decompressed == null){
+            dataSet.decompressed = DecompressJpegLossless.decode(dataSet);
+        }
+        const buf = dataSet.decompressed != null
+            ? dataSet.decompressed as ArrayBuffer
+            : dataSet.byteArray.buffer;
+        const offset = dataSet.decompressed != null ? 0 : pixelDataElement.dataOffset;
+        const length = dataSet.decompressed != null
+            ? (dataSet.decompressed as ArrayBuffer).byteLength
+            : pixelDataElement.length;
+        const aaa = new Int16Array(buf, offset, length / 2);
+
 
         for (let j = 0; j<ny; j++){
             for (let k = 0; k<nx; k++){

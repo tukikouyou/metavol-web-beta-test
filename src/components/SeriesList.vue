@@ -1,5 +1,19 @@
 <script setup lang="ts">
-defineProps<{
+import { computed, ref, inject } from 'vue';
+import { useSegmentationStore } from '../stores/segmentation';
+
+// DicomView から provide される thumbnail / slice count getter (paging 用)。
+// 未提供環境ではフォールバック (paging 機能は無効化される)。
+const getThumbnailForSlice = inject<(seriesIdx: number, sliceIdx: number) => string | null>(
+    'getThumbnailForSlice',
+    () => null,
+);
+const getSliceCount = inject<(seriesIdx: number) => number>(
+    'getSliceCount',
+    () => 0,
+);
+
+const props = defineProps<{
     series: Array<{
         index: number;
         description: string;
@@ -9,18 +23,156 @@ defineProps<{
         fileCount: number;
         hasVolume: boolean;
         thumbnail: string | null;
+        seriesUID: string;
+        transferSyntaxName: string;
+        transferSyntaxSupported: boolean;
+        transferSyntaxReason?: string;
+        acquisitionTime?: string;
+        studyDate?: string;
+        studyUID?: string;
+        attenuationCorrected?: boolean;
+        isPrimary: boolean;
+        isRgb: boolean;
     }>;
 }>();
 
 const emit = defineEmits<{
-    (e: 'select', index: number): void;
+    (e: 'setModality', payload: { index: number; modality: 'PT' | 'CT' }): void;
+    (e: 'setActiveForSeg', payload: { index: number; modality: 'PT' | 'CT' }): void;
 }>();
+
+// Drag start: custom mime に series index を載せる。
+// ImageBox の drop ハンドラでこの mime を検出してシリーズ差替えを発火する。
+const onCardDragStart = (e: DragEvent, index: number) => {
+    if (!e.dataTransfer) return;
+    e.dataTransfer.setData('application/x-metavol-series', String(index));
+    e.dataTransfer.effectAllowed = 'copy';
+};
+
+const segStore = useSegmentationStore();
+
+// 同一 modality の series が 2 個以上あるときだけ ★ を表示する (誤操作防止)。
+const ptCount = computed(() => props.series.filter(s => s.modality === 'PT' || s.modality === 'PET').length);
+const ctCount = computed(() => props.series.filter(s => s.modality === 'CT').length);
+
+const showActiveStarFor = (s: { modality: string }): 'PT' | 'CT' | null => {
+    const m = (s.modality ?? '').toUpperCase();
+    if ((m === 'PT' || m === 'PET') && ptCount.value >= 2) return 'PT';
+    if (m === 'CT' && ctCount.value >= 2) return 'CT';
+    return null;
+};
+
+const isActiveForSeg = (s: { seriesUID: string; modality: string }): boolean => {
+    const m = (s.modality ?? '').toUpperCase();
+    if (m === 'PT' || m === 'PET') {
+        return !!s.seriesUID && segStore.petVolumeRef?.metadata?.seriesUID === s.seriesUID;
+    }
+    if (m === 'CT') {
+        return !!s.seriesUID && segStore.ctVolumeRef?.metadata?.seriesUID === s.seriesUID;
+    }
+    return false;
+};
+
+const toggleActive = (e: MouseEvent, index: number, modality: 'PT' | 'CT') => {
+    e.stopPropagation();
+    emit('setActiveForSeg', { index, modality });
+};
 
 const modalityChip = (m: string): { color: string; text: string } => {
     if (m === 'PT' || m === 'PET') return { color: '#ff9b3a', text: 'PT' };
     if (m === 'CT') return { color: '#7ad0ff', text: 'CT' };
     if (m === 'MR') return { color: '#a78bfa', text: 'MR' };
-    return { color: '#888', text: m };
+    return { color: '#888', text: m || '??' };
+};
+
+const isUnknownModality = (m: string): boolean => {
+    const u = (m ?? '').toUpperCase();
+    return u !== 'PT' && u !== 'PET' && u !== 'CT' && u !== 'MR';
+};
+
+const setModality = (e: MouseEvent, index: number, modality: 'PT' | 'CT') => {
+    e.stopPropagation();
+    emit('setModality', { index, modality });
+};
+
+// Primary / Other 分離 (Other はデフォルト非表示、トグルで展開)
+const primarySeries = computed(() => props.series.filter(s => s.isPrimary));
+const otherSeries   = computed(() => props.series.filter(s => !s.isPrimary));
+const showOthers = ref(false);
+
+// ===== サムネ paging (preview only) =====
+// 各カードごとに「現在プレビュー中の slice index」を保持。drag で更新。
+const previewSliceIdx = ref<Map<number, number>>(new Map());     // seriesIdx -> sliceIdx
+const previewThumb     = ref<Map<number, string>>(new Map());    // seriesIdx -> dataURL
+
+// drag セッション state
+let pagingActive = false;
+let pagingSeriesIdx = -1;
+let pagingStartY = 0;
+let pagingStartSlice = 0;
+let pagingTotalSlices = 0;
+
+const PX_PER_SLICE_DENOM = 84; // thumb 高さ。dragY = thumb 高さ → slice 範囲全体
+
+const onThumbMouseDown = (e: MouseEvent, seriesIdx: number) => {
+    // 左ボタンのみ
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const total = getSliceCount(seriesIdx);
+    if (total <= 1) return;
+
+    pagingActive = true;
+    pagingSeriesIdx = seriesIdx;
+    pagingStartY = e.clientY;
+    pagingStartSlice = previewSliceIdx.value.get(seriesIdx) ?? Math.floor(total / 2);
+    pagingTotalSlices = total;
+
+    // global listener: thumb から外れても drag 継続
+    window.addEventListener('mousemove', onThumbMouseMoveGlobal);
+    window.addEventListener('mouseup', onThumbMouseUpGlobal);
+    // body cursor を ns-resize に固定 (thumb 範囲外に出ても visual feedback 維持)
+    document.body.style.cursor = 'ns-resize';
+};
+
+const onThumbMouseMoveGlobal = (e: MouseEvent) => {
+    if (!pagingActive) return;
+    const dy = e.clientY - pagingStartY;
+    // dy 1px = (total / 84) slice 進む
+    const deltaSlice = Math.round(dy * pagingTotalSlices / PX_PER_SLICE_DENOM);
+    let newSlice = pagingStartSlice + deltaSlice;
+    if (newSlice < 0) newSlice = 0;
+    if (newSlice >= pagingTotalSlices) newSlice = pagingTotalSlices - 1;
+    if (previewSliceIdx.value.get(pagingSeriesIdx) === newSlice) return;
+
+    previewSliceIdx.value.set(pagingSeriesIdx, newSlice);
+    const thumb = getThumbnailForSlice(pagingSeriesIdx, newSlice);
+    if (thumb) previewThumb.value.set(pagingSeriesIdx, thumb);
+    // reactive な map 変更通知のため新しい Map を作って差し替え
+    previewSliceIdx.value = new Map(previewSliceIdx.value);
+    previewThumb.value = new Map(previewThumb.value);
+};
+
+const onThumbMouseUpGlobal = () => {
+    pagingActive = false;
+    pagingSeriesIdx = -1;
+    window.removeEventListener('mousemove', onThumbMouseMoveGlobal);
+    window.removeEventListener('mouseup', onThumbMouseUpGlobal);
+    document.body.style.cursor = '';
+};
+
+// 表示用 thumbnail: paging 中に書き換えがあればそれを使う、なければ初期サムネ
+const thumbSrcFor = (s: { index: number; thumbnail: string | null }): string | null => {
+    return previewThumb.value.get(s.index) ?? s.thumbnail;
+};
+
+// オーバーレイ表示用の slice 位置 (例: "87 / 372")
+const sliceLabelFor = (s: { index: number }): string | null => {
+    const idx = previewSliceIdx.value.get(s.index);
+    if (idx == null) return null;
+    const total = getSliceCount(s.index);
+    if (total <= 1) return null;
+    return `${idx + 1} / ${total}`;
 };
 </script>
 
@@ -29,30 +181,132 @@ const modalityChip = (m: string): { color: string; text: string } => {
         <div v-if="series.length === 0" class="text-caption text-disabled px-2">
             No series
         </div>
+
+        <!-- Primary series (PET-CT fusion 解析対象) -->
         <div
-            v-for="s in series"
-            :key="s.index"
+            v-for="s in primarySeries"
+            :key="`p-${s.index}`"
             class="series-card"
-            @click="emit('select', s.index)"
+            :class="{ 'is-active-seg': isActiveForSeg(s) }"
+            draggable="true"
+            @dragstart="(e: DragEvent) => onCardDragStart(e, s.index)"
+            :title="'Drag this card onto an image box to load this series'"
         >
-            <div class="thumb">
-                <img v-if="s.thumbnail" :src="s.thumbnail" />
+            <div
+                class="thumb"
+                draggable="false"
+                @mousedown="(e: MouseEvent) => onThumbMouseDown(e, s.index)"
+                @dragstart.prevent.stop
+                title="Drag up/down on the thumbnail to scrub slices (preview only)"
+            >
+                <img v-if="thumbSrcFor(s)" :src="thumbSrcFor(s) as string" draggable="false" />
                 <div v-else class="thumb-placeholder">
                     <v-icon icon="mdi-image-off-outline" size="small"></v-icon>
                 </div>
+                <span v-if="sliceLabelFor(s)" class="slice-label">{{ sliceLabelFor(s) }}</span>
+                <button
+                    v-if="showActiveStarFor(s)"
+                    class="star-btn"
+                    :class="{ 'is-active': isActiveForSeg(s) }"
+                    :title="isActiveForSeg(s)
+                        ? `Currently active ${showActiveStarFor(s)} for segmentation`
+                        : `Set as active ${showActiveStarFor(s)} for segmentation`"
+                    @mousedown.stop
+                    @click="(e) => toggleActive(e, s.index, showActiveStarFor(s) as 'PT' | 'CT')"
+                >
+                    <v-icon
+                        :icon="isActiveForSeg(s) ? 'mdi-star' : 'mdi-star-outline'"
+                        size="x-small"
+                    />
+                </button>
             </div>
             <div class="meta">
                 <div class="row1">
                     <span class="modality" :style="{ background: modalityChip(s.modality).color }">
                         {{ modalityChip(s.modality).text }}
                     </span>
+                    <span
+                        v-if="s.attenuationCorrected !== undefined"
+                        class="attn-chip"
+                        :class="{ 'is-attn': s.attenuationCorrected, 'is-nac': !s.attenuationCorrected }"
+                        :title="s.attenuationCorrected ? 'Attenuation Corrected (CTAC)' : 'Non-Attenuation Corrected (NAC)'"
+                    >{{ s.attenuationCorrected ? 'ATTN' : 'NAC' }}</span>
+                    <span
+                        v-if="s.isRgb"
+                        class="rgb-chip"
+                        title="Color (RGB) image — usable as 2D only, not for fusion analysis"
+                    >RGB</span>
                     <span class="desc" :title="s.description">{{ s.description }}</span>
                 </div>
                 <div class="row2">{{ s.matrixSize }}</div>
                 <div class="row3">{{ s.voxelSize }}</div>
                 <div class="row4">
                     <span v-if="s.fileCount > 0">{{ s.fileCount }} files</span>
+                    <span v-if="s.acquisitionTime" class="info-pill">{{ s.acquisitionTime }}</span>
+                    <span v-if="s.studyDate" class="info-pill">{{ s.studyDate }}</span>
                     <span v-if="s.hasVolume" class="vol-tag">VOL</span>
+                </div>
+                <div
+                    v-if="!s.transferSyntaxSupported"
+                    class="row-unsupported"
+                    :title="s.transferSyntaxReason ?? 'Unsupported transfer syntax'"
+                >
+                    <v-icon icon="mdi-alert-circle" size="x-small" />
+                    Unsupported: {{ s.transferSyntaxName }}
+                </div>
+                <div v-if="s.hasVolume && isUnknownModality(s.modality)" class="row5">
+                    <span class="hint">Set as:</span>
+                    <button class="set-mod" @click="(e) => setModality(e, s.index, 'PT')">PT</button>
+                    <button class="set-mod" @click="(e) => setModality(e, s.index, 'CT')">CT</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Other (MIP / RGB / DERIVED) — デフォルト非表示、トグルで展開 -->
+        <div v-if="otherSeries.length > 0" class="other-section">
+            <button class="other-toggle" @click="showOthers = !showOthers">
+                <v-icon
+                    :icon="showOthers ? 'mdi-chevron-down' : 'mdi-chevron-right'"
+                    size="small"
+                />
+                <span>Other ({{ otherSeries.length }})</span>
+                <span class="other-hint">MIP / RGB / derived</span>
+            </button>
+            <div v-if="showOthers">
+                <div
+                    v-for="s in otherSeries"
+                    :key="`o-${s.index}`"
+                    class="series-card is-other"
+                    :class="{ 'is-active-seg': isActiveForSeg(s) }"
+                    draggable="true"
+                    @dragstart="(e: DragEvent) => onCardDragStart(e, s.index)"
+                    :title="'Drag this card onto an image box to load this series'"
+                >
+                    <div
+                        class="thumb"
+                        draggable="false"
+                        @mousedown="(e: MouseEvent) => onThumbMouseDown(e, s.index)"
+                        @dragstart.prevent.stop
+                    >
+                        <img v-if="thumbSrcFor(s)" :src="thumbSrcFor(s) as string" draggable="false" />
+                        <div v-else class="thumb-placeholder">
+                            <v-icon icon="mdi-image-off-outline" size="small"></v-icon>
+                        </div>
+                        <span v-if="sliceLabelFor(s)" class="slice-label">{{ sliceLabelFor(s) }}</span>
+                    </div>
+                    <div class="meta">
+                        <div class="row1">
+                            <span class="modality" :style="{ background: modalityChip(s.modality).color }">
+                                {{ modalityChip(s.modality).text }}
+                            </span>
+                            <span v-if="s.isRgb" class="rgb-chip" title="Color (RGB) image">RGB</span>
+                            <span class="desc" :title="s.description">{{ s.description }}</span>
+                        </div>
+                        <div class="row2">{{ s.matrixSize }}</div>
+                        <div class="row4">
+                            <span v-if="s.fileCount > 0">{{ s.fileCount }} files</span>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -67,9 +321,12 @@ const modalityChip = (m: string): { color: string; text: string } => {
     background: var(--mv-surface-2);
     border-radius: 4px;
     margin-bottom: 6px;
-    cursor: pointer;
+    cursor: grab;
     border: 1px solid transparent;
     transition: border-color 0.15s, background 0.15s;
+}
+.series-card:active {
+    cursor: grabbing;
 }
 .series-card:hover {
     border-color: var(--mv-border-strong);
@@ -77,8 +334,9 @@ const modalityChip = (m: string): { color: string; text: string } => {
 }
 
 .thumb {
-    width: 56px;
-    height: 56px;
+    position: relative;
+    width: 84px;
+    height: 84px;
     background: #000;
     border-radius: 3px;
     overflow: hidden;
@@ -86,6 +344,96 @@ const modalityChip = (m: string): { color: string; text: string } => {
     display: flex;
     align-items: center;
     justify-content: center;
+    /* paging gesture をしやすく: 縦ドラッグであることを示す cursor */
+    cursor: ns-resize;
+    user-select: none;
+}
+
+/* paging 中の "87 / 372" オーバーレイラベル */
+.slice-label {
+    position: absolute;
+    bottom: 2px;
+    left: 2px;
+    right: 2px;
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 10px;
+    text-align: center;
+    color: #fff;
+    background: rgba(0,0,0,0.55);
+    padding: 1px 4px;
+    border-radius: 2px;
+    pointer-events: none;
+    line-height: 1.3;
+}
+
+.star-btn {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 3px;
+    color: var(--mv-text-dim, #8FA0B0);
+    cursor: pointer;
+    padding: 0;
+    transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.star-btn:hover {
+    color: var(--mv-accent, #00D4AA);
+    border-color: var(--mv-accent-dim, #007E66);
+    background: rgba(0, 212, 170, 0.18);
+}
+.star-btn.is-active {
+    color: var(--mv-warning, #FFB454);
+    border-color: var(--mv-warning, #FFB454);
+    background: rgba(255, 180, 84, 0.16);
+}
+
+.series-card.is-active-seg {
+    border-color: var(--mv-accent, #00D4AA);
+    background: rgba(0, 212, 170, 0.05);
+}
+
+/* Other (derived/MIP/RGB) section */
+.series-card.is-other {
+    opacity: 0.78;
+}
+.series-card.is-other:hover {
+    opacity: 1;
+}
+.other-section {
+    margin-top: 8px;
+    border-top: 1px solid var(--mv-border);
+    padding-top: 6px;
+}
+.other-toggle {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    background: transparent;
+    border: none;
+    padding: 4px 6px;
+    color: var(--mv-text-dim, #8FA0B0);
+    font-size: 11px;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 3px;
+}
+.other-toggle:hover {
+    background: var(--mv-surface-2);
+    color: var(--mv-text);
+}
+.other-hint {
+    margin-left: auto;
+    font-size: 9px;
+    color: var(--mv-text-muted);
+    font-style: italic;
 }
 .thumb img {
     width: 100%;
@@ -147,5 +495,84 @@ const modalityChip = (m: string): { color: string; text: string } => {
 .vol-tag {
     color: var(--mv-accent);
     font-weight: 600;
+}
+
+.attn-chip {
+    font-size: 9px;
+    font-weight: 700;
+    padding: 0 4px;
+    border-radius: 2px;
+    line-height: 1.5;
+    flex-shrink: 0;
+    letter-spacing: 0.04em;
+}
+.attn-chip.is-attn {
+    background: #ff9b3a;
+    color: #0F1419;
+}
+.attn-chip.is-nac {
+    background: transparent;
+    color: var(--mv-text-dim, #8FA0B0);
+    border: 1px solid var(--mv-border-strong, #3A4A5C);
+}
+
+.rgb-chip {
+    font-size: 9px;
+    font-weight: 700;
+    padding: 0 4px;
+    border-radius: 2px;
+    line-height: 1.5;
+    flex-shrink: 0;
+    letter-spacing: 0.04em;
+    background: linear-gradient(90deg, #ff5577 0%, #ffd54f 50%, #66cc88 100%);
+    color: #0F1419;
+}
+
+.info-pill {
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 9px;
+    color: var(--mv-text-dim, #8FA0B0);
+    background: rgba(255,255,255,0.04);
+    padding: 0 4px;
+    border-radius: 2px;
+}
+
+.row-unsupported {
+    margin-top: 4px;
+    font-size: 10px;
+    color: var(--mv-error, #FF5C7A);
+    background: rgba(255, 92, 122, 0.08);
+    border: 1px solid rgba(255, 92, 122, 0.3);
+    border-radius: 3px;
+    padding: 2px 4px;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+}
+
+.row5 {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 2px;
+}
+.row5 .hint {
+    color: var(--mv-text-muted);
+    font-size: 10px;
+}
+.set-mod {
+    background: var(--mv-surface-2, #1a232b);
+    border: 1px solid var(--mv-border-strong, #3a4a55);
+    color: var(--mv-text);
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 2px;
+    cursor: pointer;
+    line-height: 1.4;
+}
+.set-mod:hover {
+    border-color: var(--mv-accent, #00D4AA);
+    color: var(--mv-accent, #00D4AA);
 }
 </style>
