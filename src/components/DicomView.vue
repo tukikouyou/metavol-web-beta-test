@@ -38,8 +38,10 @@ import { generateVolumeFromDicom } from './dicom2volume.ts';
 import * as DecompressJpegLossless from "./decompressJpegLossless";
 import { getSeriesTransferSyntaxInfo } from "./transferSyntax";
 import { isPrimaryForFusion, isRgbSeries } from "./seriesClassify";
+import { buildClutLegend, type ClutLegend } from "./clutLegend";
 import { ensureWasmCodecsReady, isWasmCodecsReady } from "./wasmCodec";
 import { Volume, voxelToWorld, worldToVoxel } from "./Volume.ts";
+import { solve } from "./linalg";
 import * as THREE from 'three';
 import {cluts, labelClut} from './Clut.ts';
 import * as nifti from 'nifti-reader-js';
@@ -49,6 +51,8 @@ import { sphereStatsInPet, fillPolygonOnSlice, findMaximumAxis as maxAxis } from
 import SegmentationPanel from './SegmentationPanel.vue';
 import DebugInspector from './DebugInspector.vue';
 import { computed, onMounted, nextTick, provide } from 'vue';
+import { useAutoSave } from '../composables/useAutoSave';
+import { loadSession, deleteSession, type SessionPayload } from '../stores/persistence';
 
 const segStore = useSegmentationStore();
 
@@ -142,7 +146,8 @@ export interface SeriesSummary {
 const seriesSummaries = ref<SeriesSummary[]>([]);
 
 // ===== デバッグ機能 =====
-const debugMode = ref(false);
+// Voxel inspector (旧 debugMode) — App-bar からも toggle 可能なよう defineModel で公開
+const debugMode = defineModel<boolean>('debugMode', { default: false });
 const debugHoverRows = ref<Array<{
   seriesIndex: number; modality: string; description: string;
   i: number; j: number; k: number;
@@ -163,11 +168,16 @@ const applyAutoFit = () => {
   imageBoxH.value = h;
 };
 
-// URL ?debug=1 で初期有効化、Ctrl+Shift+D で toggle
+// URL params:
+//   ?debug=1       voxel inspector を初期有効化
+//   ?dev=case001   sample-data/case001 を自動 fetch + loadFiles + PET Standard
+// Ctrl+Shift+D で voxel inspector を toggle
 onMounted(() => {
   try {
     const p = new URLSearchParams(window.location.search);
     if (p.get('debug') === '1') debugMode.value = true;
+    const devCase = p.get('dev');
+    if (devCase) loadDevCase(devCase);
   } catch {}
   window.addEventListener('keydown', (e: KeyboardEvent) => {
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'D' || e.key === 'd')){
@@ -179,6 +189,105 @@ onMounted(() => {
   });
   window.addEventListener('resize', applyAutoFit);
 });
+
+// Vite dev middleware (vite.config.mts の devSampleDataPlugin) 経由で
+// sample-data/<caseId>/ 配下を fetch、loadFiles に流し込む。
+// 完了後に PET Standard layout を自動セットアップする。
+const loadDevCase = async (caseId: string) => {
+  try {
+    const listRes = await fetch(`/api/cases/${encodeURIComponent(caseId)}/files`);
+    if (!listRes.ok) {
+      console.warn(`[dev-case] case "${caseId}" not found (HTTP ${listRes.status})`);
+      return;
+    }
+    const fileNames: string[] = await listRes.json();
+    if (!Array.isArray(fileNames) || fileNames.length === 0) {
+      console.warn(`[dev-case] case "${caseId}" has no files`);
+      return;
+    }
+    console.log(`[dev-case] loading ${fileNames.length} files from "${caseId}"...`);
+    const t0 = performance.now();
+    const files: File[] = [];
+    // 並列 fetch (10 並列まで)。File オブジェクトに変換して loadFiles へ。
+    const concurrency = 10;
+    let idx = 0;
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (idx < fileNames.length) {
+        const my = idx++;
+        const name = fileNames[my];
+        const r = await fetch(`/samples/${encodeURIComponent(caseId)}/${name.split('/').map(encodeURIComponent).join('/')}`);
+        if (!r.ok) { console.warn(`[dev-case] fetch failed: ${name}`); continue; }
+        const buf = await r.arrayBuffer();
+        files[my] = new File([buf], name.split('/').pop() ?? name, { type: 'application/octet-stream' });
+      }
+    });
+    await Promise.all(workers);
+    const t1 = performance.now();
+    console.log(`[dev-case] fetched ${files.length} files in ${(t1 - t0).toFixed(0)}ms`);
+    loadFiles(files.filter(Boolean));
+  } catch (err) {
+    console.warn('[dev-case] failed', err);
+  }
+};
+
+// ===== 自動保存 + リカバリ (IndexedDB persistence) =====
+useAutoSave();   // composable: maskVersion 等を watch して debounce 保存
+
+const recoveryCandidate = ref<SessionPayload | null>(null);
+const showRecoveryDialog = ref(false);
+const lastCheckedRecoveryUid = ref<string | null>(null);
+
+// PT volume が変わったら IndexedDB に対応 session があるか確認、あればダイアログ。
+watch(() => segStore.petVolumeRef?.metadata?.seriesUID ?? null, async (uid) => {
+  if (!uid || uid === lastCheckedRecoveryUid.value) return;
+  lastCheckedRecoveryUid.value = uid;
+  try {
+    const session = await loadSession(uid);
+    if (!session) return;
+    // 直前 (10 秒以内) に自動保存されたばかりのものは出さない (現セッション継続)
+    if (segStore.lastAutoSavedAt && session.savedAt <= segStore.lastAutoSavedAt + 10000) return;
+    recoveryCandidate.value = session;
+    showRecoveryDialog.value = true;
+  } catch (err) {
+    console.warn('[auto-save] loadSession failed', err);
+  }
+});
+
+const formatRelativeTime = (ts: number): string => {
+  const dt = Math.max(0, Date.now() - ts);
+  const sec = Math.floor(dt / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr} h ago`;
+  const day = Math.floor(hr / 24);
+  return `${day} d ago`;
+};
+
+const onRecoverYes = () => {
+  if (!recoveryCandidate.value) return;
+  const res = segStore.restoreFromPersistence(recoveryCandidate.value);
+  if (!res.ok) {
+    alert('Could not recover the session: ' + res.reason);
+  } else {
+    show();
+  }
+  recoveryCandidate.value = null;
+  showRecoveryDialog.value = false;
+};
+const onRecoverDiscard = async () => {
+  if (recoveryCandidate.value) {
+    try { await deleteSession(recoveryCandidate.value.seriesUID); } catch {}
+  }
+  recoveryCandidate.value = null;
+  showRecoveryDialog.value = false;
+};
+const onRecoverSkip = () => {
+  // 削除も復元もしない (次回ロード時にまた聞かれる)
+  recoveryCandidate.value = null;
+  showRecoveryDialog.value = false;
+};
 
 // drawer / inspector / tileN の変化に追従して fit
 watch([drawer, inspector, tileN], () => {
@@ -332,14 +441,15 @@ const getBoxDescription = (i: number): string => {
 };
 
 // 現在の plane を box state から導出。Volume の vecx/vecy/vecz を見て
-// determinePlaneDirection で軸面を判別、isMip を見て MIP/sMIP を判別。
+// determinePlaneDirection で軸面を判別、isMip / isVr を見て MIP/sMIP/VR を判別。
 // 注意: defaultInfo (未ロードの初期状態) は clut を持つが vecx を持たないため、
 // `isAnyVolumeBox` が true を返しても vecx の defensive check が必須。
-const getBoxCurrentPlane = (i: number): 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | null => {
+const getBoxCurrentPlane = (i: number): 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | 'vr' | null => {
   if (i < 0 || i >= imageBoxInfos.value.length) return null;
   if (!isAnyVolumeBox(i)) return null;
   const d = imageBoxInfos.value[i] as VolumeImageBoxInfo;
   if (!d.vecx || !d.vecy || !d.vecz) return null;
+  if (d.isVr) return 'vr';
   if (d.isMip) return d.mip?.isSurface ? 'smip' : 'mip';
   const dir = determinePlaneDirection(d);
   if (dir === 'axial')    return 'axi';
@@ -353,6 +463,64 @@ const getBoxCurrentClut = (i: number): number | undefined => {
   return (imageBoxInfos.value[i] as VolumeImageBoxInfo).clut;
 };
 
+// suffix 判定: PT は SUV 単位、CT は HU、それ以外は無印
+const suffixForModality = (m: string): string => {
+  const u = (m ?? '').toUpperCase();
+  if (u === 'PT' || u === 'PET') return 'SUV';
+  if (u === 'CT') return 'HU';
+  return '';
+};
+
+// 主レイヤ legend (Volume / Fusion / MIP)。Dicom box は undefined。
+const getBoxLegend = (i: number): ClutLegend | undefined => {
+  if (i < 0 || i >= imageBoxInfos.value.length) return undefined;
+  if (isDicomImageBoxInfo(i)) return undefined;
+  if (!isAnyVolumeBox(i)) return undefined;
+  const info = imageBoxInfos.value[i] as VolumeImageBoxInfo;
+  if (info.myWC == null || info.myWW == null) return undefined;
+  // Fusion box の場合: legend (主レイヤ) は CT
+  if (isFusedImageBoxInfo(i)) {
+    const f = info as FusedVolumeImageBoxInfo;
+    const ctSeries = seriesList[f.currentSeriesNumber];
+    const ctMod = ctSeries?.volume?.metadata?.modality
+      ?? (ctSeries?.myDicom?.[0]?.string('x00080060') ?? '').toUpperCase();
+    return buildClutLegend(f.clut, f.myWC!, f.myWW!, suffixForModality(ctMod));
+  }
+  // Volume / MIP box
+  const series = seriesList[info.currentSeriesNumber];
+  const mod = series?.volume?.metadata?.modality
+    ?? (series?.myDicom?.[0]?.string('x00080060') ?? '').toUpperCase();
+  return buildClutLegend(info.clut, info.myWC!, info.myWW!, suffixForModality(mod));
+};
+
+// Crosshair の screen 投影 (Volume / Fusion box のみ意味あり)
+const getBoxCrosshairX = (i: number): number | null => {
+  void segStore.crosshairVersion;     // reactive 依存
+  const w = segStore.crosshairWorld;
+  if (!w) return null;
+  const s = worldToScreen(i, w);
+  return s ? s.sx : null;
+};
+const getBoxCrosshairY = (i: number): number | null => {
+  void segStore.crosshairVersion;
+  const w = segStore.crosshairWorld;
+  if (!w) return null;
+  const s = worldToScreen(i, w);
+  return s ? s.sy : null;
+};
+
+// 第二レイヤ legend (Fusion box の PET レイヤのみ。それ以外は undefined)
+const getBoxLegend2 = (i: number): ClutLegend | undefined => {
+  if (i < 0 || i >= imageBoxInfos.value.length) return undefined;
+  if (!isFusedImageBoxInfo(i)) return undefined;
+  const f = imageBoxInfos.value[i] as FusedVolumeImageBoxInfo;
+  if (f.myWC1 == null || f.myWW1 == null) return undefined;
+  const petSeries = seriesList[f.currentSeriesNumber1];
+  const petMod = petSeries?.volume?.metadata?.modality
+    ?? (petSeries?.myDicom?.[0]?.string('x00080060') ?? '').toUpperCase();
+  return buildClutLegend(f.clut1, f.myWC1!, f.myWW1!, suffixForModality(petMod));
+};
+
 // per-box Sync opt-out
 const boxSyncEnabled = ref<boolean[]>([true, true, true, true, true, true, true, true]);
 const isBoxSyncEnabled = (i: number) => boxSyncEnabled.value[i] ?? true;
@@ -360,6 +528,21 @@ const isBoxSyncEnabled = (i: number) => boxSyncEnabled.value[i] ?? true;
 // per-box mask overlay opt-out (true = この Box ではマスク非表示)
 const boxOverlayDisabled = ref<boolean[]>([false, false, false, false, false, false, false, false]);
 const isBoxOverlayEnabled = (i: number) => !boxOverlayDisabled.value[i];
+
+// MIP 高速モード: ホイールで角度を変えている間だけ fast=true で描画 (4x speedup)。
+// 静止 (200ms) で full-res で再描画。box ごとに独立 timer を持つ。
+const mipFastBoxes = new Set<number>();
+const mipIdleTimers = new Map<number, ReturnType<typeof setTimeout>>();
+const triggerMipFast = (i: number) => {
+  mipFastBoxes.add(i);
+  const old = mipIdleTimers.get(i);
+  if (old != null) clearTimeout(old);
+  mipIdleTimers.set(i, setTimeout(() => {
+    mipFastBoxes.delete(i);
+    mipIdleTimers.delete(i);
+    showImage(i);  // full-res で再描画
+  }, 200));
+};
 
 // ---- Title bar emit ハンドラ ----
 const onTitlebarClose = (i: number) => {
@@ -419,12 +602,13 @@ const onTitlebarResetView = (i: number) => {
   showImage(i);
 };
 
-const setPlaneOnBox = (i: number, plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip') => {
+const setPlaneOnBox = (i: number, plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | 'vr') => {
   if (!isAnyVolumeBox(i)) return;
   const d = imageBoxInfos.value[i] as VolumeImageBoxInfo;
 
   if (plane === 'mip' || plane === 'smip') {
     d.isMip = true;
+    d.isVr = false;
     if (d.mip == null) {
       d.mip = { mipAngle: 0, isSurface: plane === 'smip', thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 };
     } else {
@@ -434,8 +618,20 @@ const setPlaneOnBox = (i: number, plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip')
     return;
   }
 
+  if (plane === 'vr') {
+    // VR: MIP と同じ rotation 機構を使うため mip オブジェクト (angle) は流用
+    d.isMip = false;
+    d.isVr = true;
+    if (d.mip == null) {
+      d.mip = { mipAngle: 0, isSurface: false, thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 };
+    }
+    showImage(i);
+    return;
+  }
+
   // axi / cor / sag: 元 volume の canonical 軸を起点に再構築
   d.isMip = false;
+  d.isVr = false;
   const vol = seriesList[d.currentSeriesNumber]?.volume;
   if (!vol) {
     showImage(i);
@@ -474,7 +670,7 @@ const setClutOnBox = (i: number, clutId: number) => {
   showImage(i);
 };
 
-const onTitlebarSetPlane = (i: number, plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip') => {
+const onTitlebarSetPlane = (i: number, plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | 'vr') => {
   setPlaneOnBox(i, plane);
 };
 const onTitlebarSetClut = (i: number, clut: number) => {
@@ -552,10 +748,19 @@ const initializeDicomListsImagesBoxInfos = () => {
 initializeDicomListsImagesBoxInfos();
 
 const changeSlice_ = (add_number: number) => {
-  doOneOrAll(selectedImageBoxId.value, (id: number) => {
+  const srcId = selectedImageBoxId.value;
+  doOneOrAll(srcId, (id: number) => {
     changeSlice(id, add_number);
     showImage(id);
   });
+  // crosshair を source box の through-plane vec で連動
+  if (segStore.crosshairWorld && isAnyVolumeBox(srcId)) {
+    const src = imageBoxInfos.value[srcId] as VolumeImageBoxInfo;
+    if (src.vecz && !src.isMip) {
+      segStore.advanceCrosshair(src.vecz, add_number);
+      doOneOrAll(srcId, (i: number) => showImage(i));
+    }
+  }
 }
 
 const changeSlice = (index: number, add_number: number) => {
@@ -568,8 +773,11 @@ const changeSlice = (index: number, add_number: number) => {
     info.currentSliceNumber = temp;
   }else{
     const a = getVolumeImageBoxInfo(index);
-    if (a.isMip && a.mip != null){
+    if ((a.isMip || a.isVr) && a.mip != null){
+      // MIP / sMIP / VR は wheel で view angle を回転 (slice paging ではない)
       a.mip.mipAngle += 5*add_number;
+      // 角度変更時は fast モードに切替 + 200ms idle で full-res 再描画
+      triggerMipFast(index);
     }else{
       a.centerInWorld.addScaledVector(a.vecz, add_number);
     }
@@ -776,6 +984,16 @@ const wheel = (e: WheelEvent) => {
     changeSlice(id, change);
     showImage(id);
   });
+  // crosshair を source box の through-plane vec で連動 (1 回だけ実行)
+  const change = e.deltaY > 0 ? 1 : -1;
+  if (segStore.crosshairWorld && isAnyVolumeBox(id)) {
+    const src = imageBoxInfos.value[id] as VolumeImageBoxInfo;
+    if (src.vecz && !src.isMip) {
+      segStore.advanceCrosshair(src.vecz, change);
+      // sync が ON で他 box が描画済みの後に crosshair が動いたので再描画
+      doOneOrAll(id, (i: number) => showImage(i));
+    }
+  }
 };
 
 const getIdOfEventOccured = (e:MouseEvent | WheelEvent) => 
@@ -1008,8 +1226,9 @@ const handleSphereClick = (e: MouseEvent) => {
   const [x, y] = getCanvasXY(e);
   const w = screenToWorld(id, x, y);
   const radius = segStore.sphere?.radiusMm ?? 10;
-  segStore.setSphere(w, radius);
-  recomputeSphereStats();
+  // sphere が無ければ作成、あれば center だけ更新 (crosshair も同位置に)
+  if (!segStore.sphere) segStore.setSphere(w, radius);
+  segStore.setCrosshairWorld(w);  // 内部で sphere center 同期 + stats 再計算
   show();
 };
 
@@ -1462,8 +1681,24 @@ const showImage = (i:number) => {
     const [wc,ww] = getMyWCWW(i);
     const clut = cluts[info.clut];
 
-    if (!info.isMip){
-        imb.value![i].drawNiftiSlice(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,clut, buildMaskOverlayForBox(i));
+    if (info.isVr){
+      // Volume Rendering: front-to-back composite ray casting
+      const angle = info.mip?.mipAngle ?? 0;
+      imb.value![i].drawNiftiVR(pixelData0, nx, ny, nz, wc!, ww!,
+        p00, v01, v10, angle, clut, mipFastBoxes.has(i));
+    } else if (!info.isMip){
+        // CT 寝台除去: この volume が CT で、segStore に body mask があれば適用
+        // Pinia Proxy 回避のため seriesUID で照合 (voxel TypedArray 同一でも可)
+        const ctRefUid = segStore.ctVolumeRef?.metadata?.seriesUID;
+        const dvUid = dv.metadata?.seriesUID;
+        const isThisCt = !!ctRefUid && ctRefUid === dvUid;
+        const ctBodyMask = (segStore.ctBodyMaskEnabled
+            && segStore.ctBodyMask
+            && isThisCt)
+          ? segStore.ctBodyMask
+          : undefined;
+        imb.value![i].drawNiftiSlice(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,clut,
+          buildMaskOverlayForBox(i), ctBodyMask);
       }else{
       const angle = info.mip!.mipAngle;
       // MIP の対象 volume が PET と一致する場合のみマスク overlay を渡す
@@ -1474,7 +1709,7 @@ const showImage = (i:number) => {
         : undefined;
       imb.value![i].drawNiftiMip(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,
         angle, info.mip!.thresholdSurfaceMip, info.mip!.depthSurfaceMip, clut,
-        info.mip!.isSurface, overlayForMip);
+        info.mip!.isSurface, overlayForMip, mipFastBoxes.has(i));
       }
   }else{ // fusion
     const info = info1 as FusedVolumeImageBoxInfo;
@@ -1509,11 +1744,22 @@ const showImage = (i:number) => {
     const clut0 = cluts[info.clut];
     const clut1 = cluts[info.clut1];
 
+    // CT 寝台除去: pix0 (CT layer) が segStore.ctVolumeRef なら body mask を渡す
+    // Pinia Proxy 回避のため seriesUID で照合
+    const ctRefUid = segStore.ctVolumeRef?.metadata?.seriesUID;
+    const dv0Uid = dv0.metadata?.seriesUID;
+    const isFusionCtMatch = !!ctRefUid && ctRefUid === dv0Uid;
+    const fusionCtBodyMask = (segStore.ctBodyMaskEnabled
+        && segStore.ctBodyMask
+        && isFusionCtMatch)
+      ? segStore.ctBodyMask
+      : undefined;
     // Fusion view ではマスク overlay を描かない（要望により）。
     imb.value![i].drawNiftiSliceFusion(
       pixelData0, nx0,ny0,nz0, wc0!, ww0!, p00_0,v01_0,v10_0,clut0,
       pixelData1, nx1,ny1,nz1, wc1!, ww1!, p00_1,v01_1,v10_1,clut1,
       undefined,
+      fusionCtBodyMask,
     );
 
   }
@@ -1578,6 +1824,33 @@ const screenToWorld = (imageBoxNumber: number, x: number, y:number) => {
 const voxelToWorld_ = (p: THREE.Vector3, vol_id:number) => {
   const v = seriesList[vol_id].volume!;
   return voxelToWorld(p, v);
+}
+
+// world 座標 → 画面 (sx, sy, sz) に逆射影。screenToWorld の inverse。
+// sx, sy は canvas 内 px (0..imageBoxW/H)、sz は plane からの距離 (off-plane 判定用)。
+// Volume / Fusion box でのみ意味を持つ。
+const worldToScreen = (boxId: number, w: THREE.Vector3): { sx: number; sy: number; sz: number } | null => {
+  if (boxId < 0 || boxId >= imageBoxInfos.value.length) return null;
+  if (!isAnyVolumeBox(boxId)) return null;
+  const a = imageBoxInfos.value[boxId] as VolumeImageBoxInfo;
+  if (!a.vecx || !a.vecy || !a.vecz) return null;
+  const cx = (imageBoxW.value ?? 0) / 2;
+  const cy = (imageBoxH.value ?? 0) / 2;
+  const dx = w.x - a.centerInWorld.x;
+  const dy = w.y - a.centerInWorld.y;
+  const dz = w.z - a.centerInWorld.z;
+  // [vecx vecy vecz] * (sx_off, sy_off, sz_off)^T = (dx, dy, dz)^T
+  const A = [
+    [a.vecx.x, a.vecy.x, a.vecz.x],
+    [a.vecx.y, a.vecy.y, a.vecz.y],
+    [a.vecx.z, a.vecy.z, a.vecz.z],
+  ];
+  try {
+    const ans = solve(A, [dx, dy, dz]);
+    return { sx: ans[0] + cx, sy: ans[1] + cy, sz: ans[2] };
+  } catch {
+    return null;
+  }
 }
 
 const worldToVoxel_ = (p: THREE.Vector3, vol_id:number) => {
@@ -1866,18 +2139,20 @@ const rebuildSeriesSummaries = () => {
 }
 
 const detectPetCtFromDicom = () => {
-  // DICOM ファイル群から PET/CT modality を検出して store に登録。
+  // DICOM ファイル群から PET/CT/MR modality を検出して store に登録。
   // volume が未生成のシリーズは modality タグだけでも検出して候補として扱う。
-  let petIdx = -1, ctIdx = -1;
+  let petIdx = -1, ctIdx = -1, mrIdx = -1;
   for (let i = 0; i < seriesList.length; i++) {
     const dlist = seriesList[i].myDicom;
     if (!dlist || dlist.length === 0) continue;
     const m = (dlist[0].string("x00080060") ?? "").toUpperCase();
     if ((m === "PT" || m === "PET") && petIdx < 0) petIdx = i;
     if (m === "CT" && ctIdx < 0) ctIdx = i;
+    if (m === "MR" && mrIdx < 0) mrIdx = i;
   }
   segStore.setPetVolume(petIdx >= 0 ? (seriesList[petIdx].volume ?? null) : null);
   segStore.setCtVolume(ctIdx >= 0 ? (seriesList[ctIdx].volume ?? null) : null);
+  segStore.setMrVolume(mrIdx >= 0 ? (seriesList[mrIdx].volume ?? null) : null);
 };
 
 const refreshSegStoreVolumeRefs = () => {
@@ -1891,6 +2166,9 @@ const refreshSegStoreVolumeRefs = () => {
     }
     if (m === "CT" && segStore.ctVolumeRef !== v) {
       segStore.setCtVolume(v);
+    }
+    if (m === "MR" && segStore.mrVolumeRef !== v) {
+      segStore.setMrVolume(v);
     }
   }
 };
@@ -2326,45 +2604,62 @@ const setupTriplanarPt = async () => {
 };
 
 // L2 Triplanar Fused: 1×3 (Fused axial / coronal / sagittal)
-const setupTriplanarFused = async () => {
-  const petIdx = findPetSeriesIndex();
-  let ctIdx = -1;
+// Fusion 用 base layer (CT or MR) を探す。CT 優先、なければ MR。
+const findBaseSeriesIndexForFusion = (): { idx: number; modality: 'CT' | 'MR' } | null => {
+  let ctIdx = -1, mrIdx = -1;
   for (let i = 0; i < seriesList.length; i++) {
     const v = seriesList[i].volume;
-    if (v && v.metadata?.modality === 'CT') { ctIdx = i; break; }
-    const dl = seriesList[i].myDicom;
-    if (dl && (dl[0]?.string('x00080060') ?? '').toUpperCase() === 'CT' && ctIdx < 0) ctIdx = i;
+    const tag = (seriesList[i].myDicom?.[0]?.string('x00080060') ?? '').toUpperCase();
+    const m = v?.metadata?.modality ?? tag;
+    if (m === 'CT' && ctIdx < 0) ctIdx = i;
+    if (m === 'MR' && mrIdx < 0) mrIdx = i;
   }
-  if (petIdx < 0 || ctIdx < 0) { alert('Both PT and CT series are required for Fusion.'); return; }
+  if (ctIdx >= 0) return { idx: ctIdx, modality: 'CT' };
+  if (mrIdx >= 0) return { idx: mrIdx, modality: 'MR' };
+  return null;
+};
+
+const setupTriplanarFused = async () => {
+  const petIdx = findPetSeriesIndex();
+  const base = findBaseSeriesIndexForFusion();
+  if (petIdx < 0 || !base) {
+    alert('PT plus a CT or MR series are required for Fusion.');
+    return;
+  }
+  const baseIdx = base.idx;
   if (!seriesList[petIdx].volume) { if (!mpr_(petIdx)) return; }
-  if (!seriesList[ctIdx].volume)  { if (!mpr_(ctIdx))  return; }
-  const ct = seriesList[ctIdx].volume!;
-  const ctP0 = voxelToWorld_(new THREE.Vector3(0, 0, 0), ctIdx);
-  const ctP1 = voxelToWorld_(new THREE.Vector3(ct.nx, ct.ny, ct.nz), ctIdx);
-  const ctCenter = ctP0.add(ctP1).divideScalar(2);
+  if (!seriesList[baseIdx].volume) { if (!mpr_(baseIdx)) return; }
+  const baseVol = seriesList[baseIdx].volume!;
+  const baseP0 = voxelToWorld_(new THREE.Vector3(0, 0, 0), baseIdx);
+  const baseP1 = voxelToWorld_(new THREE.Vector3(baseVol.nx, baseVol.ny, baseVol.nz), baseIdx);
+  const baseCenter = baseP0.add(baseP1).divideScalar(2);
+  // base modality に応じた windowing デフォルト
+  const baseWC = base.modality === 'CT' ? 40 : 0;
+  const baseWW = base.modality === 'CT' ? 400 : 1000;
+  const labelPrefix = base.modality === 'CT' ? 'Fused' : 'Fused (MR+PT)';
   const makeFused = (plane: 'axi' | 'cor' | 'sag', desc: string): FusedVolumeImageBoxInfo => {
     let vecx: THREE.Vector3, vecy: THREE.Vector3, vecz: THREE.Vector3;
     if (plane === 'cor') {
-      vecx = ct.vectorX.clone();
-      vecy = ct.vectorZ.clone().normalize().multiplyScalar(ct.vectorX.length());
-      vecz = ct.vectorY.clone();
+      vecx = baseVol.vectorX.clone();
+      vecy = baseVol.vectorZ.clone().normalize().multiplyScalar(baseVol.vectorX.length());
+      vecz = baseVol.vectorY.clone();
     } else if (plane === 'sag') {
-      vecx = ct.vectorY.clone();
-      vecy = ct.vectorZ.clone().normalize().multiplyScalar(ct.vectorY.length());
-      vecz = ct.vectorX.clone();
+      vecx = baseVol.vectorY.clone();
+      vecy = baseVol.vectorZ.clone().normalize().multiplyScalar(baseVol.vectorY.length());
+      vecz = baseVol.vectorX.clone();
     } else {
-      vecx = ct.vectorX.clone(); vecy = ct.vectorY.clone(); vecz = ct.vectorZ.clone();
+      vecx = baseVol.vectorX.clone(); vecy = baseVol.vectorY.clone(); vecz = baseVol.vectorZ.clone();
     }
     return {
-      centerInWorld: ctCenter.clone(), vecx, vecy, vecz,
+      centerInWorld: baseCenter.clone(), vecx, vecy, vecz,
       clut: 0, clut1: 2,
-      currentSeriesNumber: ctIdx, currentSeriesNumber1: petIdx,
-      description: desc, myWC: 40, myWW: 400, myWC1: 3, myWW1: 6,
+      currentSeriesNumber: baseIdx, currentSeriesNumber1: petIdx,
+      description: desc, myWC: baseWC, myWW: baseWW, myWC1: 3, myWW1: 6,
     } as FusedVolumeImageBoxInfo;
   };
-  imageBoxInfos.value[0] = makeFused('axi', 'Fused axial');
-  imageBoxInfos.value[1] = makeFused('cor', 'Fused coronal');
-  imageBoxInfos.value[2] = makeFused('sag', 'Fused sagittal');
+  imageBoxInfos.value[0] = makeFused('axi', `${labelPrefix} axial`);
+  imageBoxInfos.value[1] = makeFused('cor', `${labelPrefix} coronal`);
+  imageBoxInfos.value[2] = makeFused('sag', `${labelPrefix} sagittal`);
   tileN.value = 3;
   refreshSegStoreVolumeRefs();
   autoFitMode.value = true;
@@ -2635,11 +2930,15 @@ defineExpose({
         :box-kind="getBoxKind(i-1)"
         :current-plane="getBoxCurrentPlane(i-1)"
         :current-clut="getBoxCurrentClut(i-1)"
+        :legend="getBoxLegend(i-1)"
+        :legend2="getBoxLegend2(i-1)"
+        :crosshair-x="getBoxCrosshairX(i-1)"
+        :crosshair-y="getBoxCrosshairY(i-1)"
         :sync-enabled="isBoxSyncEnabled(i-1)"
         :global-sync-on="!!syncImageBox"
         @close-box="onTitlebarClose(i-1)"
         @reset-view="onTitlebarResetView(i-1)"
-        @set-plane="(p: 'axi'|'cor'|'sag'|'mip'|'smip') => onTitlebarSetPlane(i-1, p)"
+        @set-plane="(p: 'axi'|'cor'|'sag'|'mip'|'smip'|'vr') => onTitlebarSetPlane(i-1, p)"
         @set-clut="(c: number) => onTitlebarSetClut(i-1, c)"
         @toggle-sync="onTitlebarToggleSync(i-1)"
         @maximize="onTitlebarMaximize(i-1)"
@@ -2667,6 +2966,38 @@ defineExpose({
       <span class="hint">Shift+Click=edit voxel / Ctrl+Shift+D=toggle</span>
     </div>
   </div>
+
+  <!-- Auto-save recovery dialog -->
+  <v-dialog v-model="showRecoveryDialog" max-width="480" persistent>
+    <v-card v-if="recoveryCandidate" class="mv-recovery-card">
+      <v-card-title class="mv-recovery-title">
+        <v-icon icon="mdi-history" class="mr-2" color="primary" />
+        Recover previous session?
+      </v-card-title>
+      <v-card-text>
+        <div class="mv-recovery-line">
+          <strong>{{ recoveryCandidate.seriesDescription || 'Unknown series' }}</strong>
+        </div>
+        <div class="mv-recovery-line mv-recovery-meta">
+          Last edited <strong>{{ formatRelativeTime(recoveryCandidate.savedAt) }}</strong>
+          ({{ new Date(recoveryCandidate.savedAt).toLocaleString() }})
+        </div>
+        <div class="mv-recovery-line mv-recovery-meta">
+          {{ recoveryCandidate.dims[0] }}×{{ recoveryCandidate.dims[1] }}×{{ recoveryCandidate.dims[2] }}
+          · {{ recoveryCandidate.labels?.length ?? 0 }} labels
+        </div>
+        <div class="mv-recovery-hint">
+          Loading the saved mask will replace any current segmentation on this PT.
+        </div>
+      </v-card-text>
+      <v-card-actions>
+        <v-btn variant="text" @click="onRecoverDiscard">Discard saved</v-btn>
+        <v-spacer />
+        <v-btn variant="text" @click="onRecoverSkip">Skip</v-btn>
+        <v-btn variant="flat" color="primary" @click="onRecoverYes">Recover</v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
 </template>
 
 <style scoped>
@@ -2719,6 +3050,37 @@ defineExpose({
   letter-spacing: 0;
   color: var(--mv-text-muted);
   margin-left: 6px;
+}
+
+/* Auto-save recovery dialog */
+.mv-recovery-card {
+  background: var(--mv-surface) !important;
+  color: var(--mv-text);
+}
+.mv-recovery-title {
+  display: flex;
+  align-items: center;
+  font-size: 16px !important;
+  font-weight: 600;
+  padding-top: 16px !important;
+}
+.mv-recovery-line {
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.mv-recovery-meta {
+  color: var(--mv-text-dim);
+  font-size: 12px;
+  font-feature-settings: 'tnum';
+}
+.mv-recovery-hint {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: rgba(255, 180, 84, 0.08);
+  border: 1px solid rgba(255, 180, 84, 0.3);
+  border-radius: 4px;
+  color: var(--mv-warning);
+  font-size: 11px;
 }
 </style>
 

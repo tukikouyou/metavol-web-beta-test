@@ -23,3 +23,9 @@ pnpm-debug.log*
 
 # Claude Code local settings
 .claude/
+
+# Local DICOM sample data (served via /api/cases for dev only)
+sample-data/
+
+# Playwright MCP scratch output
+.playwright-mcp/

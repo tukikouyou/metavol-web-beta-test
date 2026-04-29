@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia';
 import * as THREE from 'three';
 import type { Volume } from '../components/Volume';
-import { connectedComponents26, assignLabelToComponent } from '../components/segmentation/maskOps';
+import { connectedComponents26, assignLabelToComponent, extractCtBodyMask, sphereStatsInPet } from '../components/segmentation/maskOps';
 import { writeNiftiUint16, triggerDownload } from '../components/segmentation/niftiWriter';
 
 export interface LabelEntry {
@@ -63,6 +63,7 @@ const DEFAULT_LABELS: Array<{ name: string }> = [
 interface State {
     petVolumeRef: Volume | null;
     ctVolumeRef: Volume | null;
+    mrVolumeRef: Volume | null;     // MRI fusion 用 (PET + MR の base layer)
 
     thresholdMask: Uint16Array | null;
     manualEdits: Uint16Array | null;
@@ -90,12 +91,31 @@ interface State {
     componentMap: Uint16Array | null;
     componentCount: number;
     componentMapValid: boolean;
+
+    lastAutoSavedAt: number | null;  // epoch ms (auto-save 完了時刻)
+
+    // CT 寝台除去 (体マスク) — 1=体内、0=体外。CT volume と同じ次元。
+    ctBodyMask: Uint8Array | null;
+    ctBodyMaskEnabled: boolean;     // 表示時に適用するか (toggle)
+    ctBodyMaskVersion: number;      // 表示更新トリガ用
+
+    // Crosshair: 全 Box で共有する焦点位置 (world 座標)。null = 表示しない。
+    crosshairWorld: THREE.Vector3 | null;
+    crosshairVersion: number;       // ImageBox 再描画トリガ
+
+    // MR-PET registration 状態
+    mrRegistrationParams: [number, number, number, number, number, number] | null;
+    mrRegistrationSnapshot: import('../components/registration/transform').RegistrationSnapshot | null;
+    mrRegistrationVersion: number;
+    mrRegistrationInProgress: boolean;
+    mrRegistrationProgress: { level: number; nLevels: number; iter: number; mi: number } | null;
 }
 
 export const useSegmentationStore = defineStore('segmentation', {
     state: (): State => ({
         petVolumeRef: null,
         ctVolumeRef: null,
+        mrVolumeRef: null,
 
         thresholdMask: null,
         manualEdits: null,
@@ -127,6 +147,21 @@ export const useSegmentationStore = defineStore('segmentation', {
         componentMap: null,
         componentCount: 0,
         componentMapValid: false,
+
+        lastAutoSavedAt: null,
+
+        ctBodyMask: null,
+        ctBodyMaskEnabled: false,
+        ctBodyMaskVersion: 0,
+
+        crosshairWorld: null,
+        crosshairVersion: 0,
+
+        mrRegistrationParams: null,
+        mrRegistrationSnapshot: null,
+        mrRegistrationVersion: 0,
+        mrRegistrationInProgress: false,
+        mrRegistrationProgress: null,
     }),
 
     getters: {
@@ -187,6 +222,9 @@ export const useSegmentationStore = defineStore('segmentation', {
         },
         setCtVolume(v: Volume | null) {
             this.ctVolumeRef = v;
+        },
+        setMrVolume(v: Volume | null) {
+            this.mrVolumeRef = v;
         },
 
         ensureMaskAllocated(): boolean {
@@ -340,6 +378,203 @@ export const useSegmentationStore = defineStore('segmentation', {
             }
             this.maskVersion++;
             return n;
+        },
+
+        // ===== 自動保存 (IndexedDB persistence) 用シリアライズ =====
+        // 戻り値は persistence.ts の SessionPayload と互換 (サンドボックスで型を共有しないため
+        // 構造的に一致させて受け渡す)。呼び出し側 (composable) で saveSession に渡す。
+        serializeForPersistence(): {
+            seriesUID: string;
+            seriesDescription?: string;
+            savedAt: number;
+            thresholdMask?: ArrayBuffer;
+            manualEdits?: ArrayBuffer;
+            finalMask?: ArrayBuffer;
+            dims: [number, number, number];
+            voxelSizeMm?: [number, number, number];
+            threshold: number;
+            thresholdUnit: 'SUV' | 'CNTS';
+            labels: LabelEntry[];
+            currentLabelId: number;
+            sphere: { centerWorld: [number, number, number]; radiusMm: number } | null;
+        } | null {
+            const pet = this.petVolumeRef;
+            if (!pet || !pet.metadata?.seriesUID) return null;
+            // typed array を ArrayBuffer に展開して clone (主スレッド参照とは独立)
+            const cloneBuf = (a: Uint16Array | null): ArrayBuffer | undefined => {
+                if (!a) return undefined;
+                return a.buffer.slice(a.byteOffset, a.byteOffset + a.byteLength);
+            };
+            return {
+                seriesUID: pet.metadata.seriesUID,
+                seriesDescription: pet.metadata.seriesDescription,
+                savedAt: Date.now(),
+                thresholdMask: cloneBuf(this.thresholdMask),
+                manualEdits:   cloneBuf(this.manualEdits),
+                finalMask:     cloneBuf(this.finalMask),
+                dims: [pet.nx, pet.ny, pet.nz],
+                voxelSizeMm: [pet.vectorX.length(), pet.vectorY.length(), pet.vectorZ.length()],
+                threshold: this.threshold,
+                thresholdUnit: this.thresholdUnit,
+                labels: this.labels.map(l => ({ id: l.id, name: l.name, color: [...l.color] as [number,number,number] })),
+                currentLabelId: this.currentLabelId,
+                sphere: this.sphere
+                    ? { centerWorld: [this.sphere.centerWorld.x, this.sphere.centerWorld.y, this.sphere.centerWorld.z], radiusMm: this.sphere.radiusMm }
+                    : null,
+            };
+        },
+
+        // 永続化された session payload を現在 PT volume に対して復元する。
+        // dims が一致しなければ何もしない (誤った PT に当てるのを避ける)。
+        restoreFromPersistence(payload: {
+            thresholdMask?: ArrayBuffer;
+            manualEdits?: ArrayBuffer;
+            finalMask?: ArrayBuffer;
+            dims: [number, number, number];
+            threshold: number;
+            thresholdUnit: 'SUV' | 'CNTS';
+            labels: LabelEntry[];
+            currentLabelId: number;
+            sphere: { centerWorld: [number, number, number]; radiusMm: number } | null;
+            savedAt: number;
+        }): { ok: true } | { ok: false; reason: string } {
+            const pet = this.petVolumeRef;
+            if (!pet) return { ok: false, reason: 'No PET volume loaded.' };
+            const [dx, dy, dz] = payload.dims;
+            if (dx !== pet.nx || dy !== pet.ny || dz !== pet.nz) {
+                return {
+                    ok: false,
+                    reason: `Saved session dims (${dx}×${dy}×${dz}) don't match current PET (${pet.nx}×${pet.ny}×${pet.nz}).`,
+                };
+            }
+            this.ensureMaskAllocated();
+            const expectedLen = dx * dy * dz;
+            const restoreInto = (target: Uint16Array | null, src?: ArrayBuffer) => {
+                if (!target || !src) return;
+                const view = new Uint16Array(src);
+                if (view.length !== expectedLen) return;
+                target.set(view);
+            };
+            restoreInto(this.thresholdMask, payload.thresholdMask);
+            restoreInto(this.manualEdits,   payload.manualEdits);
+            restoreInto(this.finalMask,     payload.finalMask);
+            this.threshold = payload.threshold;
+            this.thresholdUnit = payload.thresholdUnit;
+            if (Array.isArray(payload.labels) && payload.labels.length > 0) {
+                this.labels = payload.labels.map(l => ({
+                    id: l.id, name: l.name,
+                    color: [l.color[0], l.color[1], l.color[2]] as [number, number, number],
+                }));
+            }
+            this.currentLabelId = payload.currentLabelId ?? (this.labels[0]?.id ?? 1);
+            // sphere は world 座標で復元
+            if (payload.sphere) {
+                this.sphere = {
+                    centerWorld: new THREE.Vector3(...payload.sphere.centerWorld),
+                    radiusMm: payload.sphere.radiusMm,
+                    suvMax: 0, suvMean: 0, suvStd: 0, voxelCount: 0,
+                };
+            }
+            this.undoStack = [];
+            this.invalidateComponentMap();
+            this.maskVersion++;
+            this.lastAutoSavedAt = payload.savedAt;
+            return { ok: true };
+        },
+
+        markAutoSaved(at: number) {
+            this.lastAutoSavedAt = at;
+        },
+
+        // ===== CT 寝台除去 =====
+        // 現在の ctVolumeRef から体マスクを抽出して保存。toggle ON で表示適用。
+        computeCtBodyMask(threshold: number = -300): boolean {
+            const ct = this.ctVolumeRef;
+            if (!ct) return false;
+            const t0 = performance.now();
+            this.ctBodyMask = extractCtBodyMask(ct.voxel, ct.nx, ct.ny, ct.nz, threshold);
+            this.ctBodyMaskEnabled = true;
+            this.ctBodyMaskVersion++;
+            const t1 = performance.now();
+            console.log(`[ct-bed-removal] body mask computed in ${(t1 - t0).toFixed(0)}ms (threshold=${threshold} HU)`);
+            return true;
+        },
+
+        toggleCtBodyMaskEnabled() {
+            this.ctBodyMaskEnabled = !this.ctBodyMaskEnabled;
+            this.ctBodyMaskVersion++;
+        },
+
+        clearCtBodyMask() {
+            this.ctBodyMask = null;
+            this.ctBodyMaskEnabled = false;
+            this.ctBodyMaskVersion++;
+        },
+
+        // ===== Crosshair (focus position synced across boxes) =====
+        // 設定すると sphere ROI が定義済みなら sphere center も同位置へ移動し stats 再計算
+        setCrosshairWorld(p: THREE.Vector3 | null) {
+            this.crosshairWorld = p ? p.clone() : null;
+            this.crosshairVersion++;
+            if (this.sphere && p) {
+                this.sphere.centerWorld.copy(p);
+                this.recomputeSphereStatsInline();
+            }
+        },
+
+        // 現在の sphere に対し PET から SUVmax/mean/std/voxelCount を計算し直す
+        recomputeSphereStatsInline() {
+            if (!this.sphere || !this.petVolumeRef) return;
+            const stats = sphereStatsInPet(this.petVolumeRef, this.sphere.centerWorld, this.sphere.radiusMm);
+            this.sphere.suvMax = stats.suvMax;
+            this.sphere.suvMean = stats.suvMean;
+            this.sphere.suvStd = stats.suvStd;
+            this.sphere.voxelCount = stats.voxelCount;
+        },
+
+        // crosshair を vec で進める (slice paging 連動用)
+        advanceCrosshair(vec: THREE.Vector3, n: number) {
+            if (!this.crosshairWorld) return;
+            this.crosshairWorld = this.crosshairWorld.clone().addScaledVector(vec, n);
+            this.crosshairVersion++;
+            if (this.sphere) {
+                this.sphere.centerWorld.copy(this.crosshairWorld);
+                this.recomputeSphereStatsInline();
+            }
+        },
+
+        clearCrosshair() {
+            this.crosshairWorld = null;
+            this.crosshairVersion++;
+        },
+
+        // ===== MR-PET registration =====
+        // MR の幾何 snapshot を初回 capture (元データを保持して何度でも再適用)
+        ensureMrRegistrationSnapshot() {
+            if (this.mrRegistrationSnapshot) return;
+            const mr = this.mrVolumeRef;
+            if (!mr) return;
+            // dynamic import を避けるため、ここでは mrRegistrationSnapshot を直接構築
+            this.mrRegistrationSnapshot = {
+                originalImagePosition: [mr.imagePosition.x, mr.imagePosition.y, mr.imagePosition.z],
+                originalVectorX: [mr.vectorX.x, mr.vectorX.y, mr.vectorX.z],
+                originalVectorY: [mr.vectorY.x, mr.vectorY.y, mr.vectorY.z],
+                originalVectorZ: [mr.vectorZ.x, mr.vectorZ.y, mr.vectorZ.z],
+                currentParams: [0, 0, 0, 0, 0, 0],
+            };
+        },
+
+        setMrRegistrationParams(p: [number, number, number, number, number, number] | null) {
+            this.mrRegistrationParams = p ? [...p] : null;
+            this.mrRegistrationVersion++;
+        },
+
+        setMrRegistrationProgress(prog: { level: number; nLevels: number; iter: number; mi: number } | null) {
+            this.mrRegistrationProgress = prog;
+        },
+
+        setMrRegistrationInProgress(b: boolean) {
+            this.mrRegistrationInProgress = b;
         },
 
         loadMaskFromNifti(

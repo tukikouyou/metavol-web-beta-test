@@ -214,6 +214,155 @@ export const connectedComponents26 = (
     return { components: out, count: nextId - 1 };
 }
 
+// CT 寝台 (table / bed / 患者固定具など) を除去するための「体マスク」抽出。
+// アルゴリズム:
+//   1. CT volume を threshold (デフォルト -300 HU) で binary 化 (体 + 寝台 + 衣服)
+//   2. 26-連結成分抽出
+//   3. 最大成分 = 体。それ以外を 0、体内 voxel を 1 とする Uint8Array を返す
+//
+// 引数 voxel は Float32Array (HU 値)。返り値は同じ長さの Uint8Array。
+// 1 = 体内 (表示する)、0 = 体外 (寝台や空気、表示時に -1024 等で塗り潰す)
+export const extractCtBodyMask = (
+    voxel: Float32Array,
+    nx: number, ny: number, nz: number,
+    threshold: number = -300,
+): Uint8Array => {
+    const N = nx * ny * nz;
+
+    // 1. binary mask
+    const binary = new Uint16Array(N);
+    for (let i = 0; i < N; i++) {
+        if (voxel[i] > threshold) binary[i] = 1;
+    }
+
+    // 2. 26-CC
+    const { components, count } = connectedComponents26(binary, nx, ny, nz);
+
+    // 3. 最大成分を見つける
+    if (count === 0) return new Uint8Array(N); // 全部 0 = 体なし
+    const sizes = new Int32Array(count + 1);
+    for (let i = 0; i < N; i++) {
+        const c = components[i];
+        if (c > 0) sizes[c]++;
+    }
+    let maxId = 1, maxSize = 0;
+    for (let c = 1; c <= count; c++) {
+        if (sizes[c] > maxSize) { maxSize = sizes[c]; maxId = c; }
+    }
+
+    const body = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+        if (components[i] === maxId) body[i] = 1;
+    }
+    return body;
+};
+
+// finalMask を 26-連結成分に分解し、各病変の SUVmax / SUVmean / MTV / TLG / 重心 (mm) を返す。
+// 1 component = 1 lesion とみなし、内部の voxel 群から:
+//   - SUVmax  : 最大 PET 値
+//   - SUVmean : 平均 PET 値
+//   - MTV_cc  : voxel 数 × voxel 体積 (mm^3) ÷ 1000
+//   - TLG     : SUVmean × MTV_cc
+//   - centroid (world mm) : i,j,k 平均を voxelToWorld 変換した位置
+//   - dominantLabelId : component 内で最も voxel 数が多い label id
+// SUVpeak (1cc 球内最大) は計算コスト高いため第二段で別ヘルパに切り出す方針 (現時点で未実装)。
+export interface LesionStat {
+    componentId: number;
+    labelId: number;
+    labelName: string;
+    voxelCount: number;
+    mtvCc: number;
+    suvMax: number;
+    suvMean: number;
+    tlg: number;
+    centroidWorld: [number, number, number];
+}
+
+export const summarizeLesions = (
+    pet: Volume,
+    mask: Uint16Array,
+    labels: Array<{ id: number; name: string; color?: [number, number, number] }>,
+): LesionStat[] => {
+    const nx = pet.nx, ny = pet.ny, nz = pet.nz;
+    const N = nx * ny * nz;
+    if (mask.length !== N) return [];
+    const voxel = pet.voxel;
+
+    // foreground = non-zero
+    const binary = new Uint16Array(N);
+    let anyFg = false;
+    for (let i = 0; i < N; i++) {
+        if (mask[i] !== 0) { binary[i] = 1; anyFg = true; }
+    }
+    if (!anyFg) return [];
+
+    const { components, count } = connectedComponents26(binary, nx, ny, nz);
+    if (count === 0) return [];
+
+    const sumSuv = new Float64Array(count + 1);
+    const maxSuv = new Float64Array(count + 1);
+    for (let c = 0; c <= count; c++) maxSuv[c] = -Infinity;
+    const sumI = new Float64Array(count + 1);
+    const sumJ = new Float64Array(count + 1);
+    const sumK = new Float64Array(count + 1);
+    const cnt = new Int32Array(count + 1);
+    const labelHist: Array<Map<number, number>> = new Array(count + 1);
+    for (let c = 0; c <= count; c++) labelHist[c] = new Map();
+
+    let p = 0;
+    for (let k = 0; k < nz; k++) {
+        for (let j = 0; j < ny; j++) {
+            for (let i = 0; i < nx; i++) {
+                const c = components[p];
+                if (c !== 0) {
+                    const v = voxel[p];
+                    sumSuv[c] += v;
+                    if (v > maxSuv[c]) maxSuv[c] = v;
+                    sumI[c] += i;
+                    sumJ[c] += j;
+                    sumK[c] += k;
+                    cnt[c]++;
+                    const lid = mask[p];
+                    labelHist[c].set(lid, (labelHist[c].get(lid) ?? 0) + 1);
+                }
+                p++;
+            }
+        }
+    }
+
+    const labelNameById = new Map<number, string>();
+    for (const l of labels) labelNameById.set(l.id, l.name);
+
+    const voxVolMm3 = pet.vectorX.length() * pet.vectorY.length() * pet.vectorZ.length();
+    const out: LesionStat[] = [];
+    const work = new THREE.Vector3();
+    for (let c = 1; c <= count; c++) {
+        const n = cnt[c];
+        if (n === 0) continue;
+        let domLid = 0, domCnt = 0;
+        for (const [lid, cc] of labelHist[c]) {
+            if (cc > domCnt) { domCnt = cc; domLid = lid; }
+        }
+        work.set(sumI[c] / n, sumJ[c] / n, sumK[c] / n);
+        const cw = voxelToWorld(work, pet);
+        const mean = sumSuv[c] / n;
+        const mtvCc = (n * voxVolMm3) / 1000;
+        out.push({
+            componentId: c,
+            labelId: domLid,
+            labelName: labelNameById.get(domLid) ?? `(label ${domLid})`,
+            voxelCount: n,
+            mtvCc,
+            suvMax: maxSuv[c],
+            suvMean: mean,
+            tlg: mean * mtvCc,
+            centroidWorld: [cw.x, cw.y, cw.z],
+        });
+    }
+    out.sort((a, b) => b.suvMax - a.suvMax);
+    return out;
+};
+
 // 与えられた voxel (i,j,k) が属する成分の全 voxel に対して mask 上で labelId に書き換える。
 export const assignLabelToComponent = (
     components: Uint16Array,

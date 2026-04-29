@@ -5,12 +5,22 @@
 import { DataSet } from "dicom-parser";
 import * as THREE from 'three';
 import { Volume } from "./Volume";
-import type { VolumeMetadata, Modality } from "../types/VolumeMetadata";
+import type { VolumeMetadata, Modality, SuvSource } from "../types/VolumeMetadata";
 import * as DecompressJpegLossless from "./decompressJpegLossless";
 
 interface MyDataSet extends DataSet {
     decompressed?: ArrayBuffer;
   }
+
+export interface SuvResult {
+    factor: number;
+    ok: boolean;
+    reason: string;
+    source: SuvSource;
+    acquisitionDt?: Date;
+    injectionDt?: Date;
+    decayCorrection?: string;
+}
 
 const detectModality = (d: MyDataSet): Modality => {
     const m = (d.string("x00080060") ?? "").toUpperCase();
@@ -23,12 +33,14 @@ const detectModality = (d: MyDataSet): Modality => {
 export const generateVolumeFromDicom = (dcmList: MyDataSet[]) => {
 
 
-    let suvFactor = 1;
-    try{
-        suvFactor = getSuvFactor(dcmList) ?? 1;
-    }catch{
-
+    // SUV factor を **構造化結果**で取得 (失敗理由・採用パスを保持)
+    let suvResult: SuvResult;
+    try {
+        suvResult = getSuvFactor(dcmList);
+    } catch (err) {
+        suvResult = { factor: 1, ok: false, reason: `exception: ${(err as Error)?.message ?? err}`, source: 'none' };
     }
+    const suvFactor = suvResult.factor;
 
     const d = dcmList[0];
     const d1 = dcmList[1];
@@ -137,6 +149,13 @@ export const generateVolumeFromDicom = (dcmList: MyDataSet[]) => {
             }
             if (dst) metadata.doseStartTimeSec = parseSecond6digits(dst);
         } catch {}
+        // SUV 計算結果のメタ情報 (UI 警告表示用)
+        metadata.suvOk = suvResult.ok;
+        metadata.suvSource = suvResult.source;
+        metadata.suvReason = suvResult.reason;
+        if (suvResult.acquisitionDt) metadata.acquisitionDateTimeIso = suvResult.acquisitionDt.toISOString();
+        if (suvResult.injectionDt) metadata.injectionDateTimeIso = suvResult.injectionDt.toISOString();
+        if (suvResult.decayCorrection) metadata.decayCorrection = suvResult.decayCorrection;
     }
 
     const dicomVolume: Volume = {
@@ -157,80 +176,244 @@ export const generateVolumeFromDicom = (dcmList: MyDataSet[]) => {
 
 
 
-let log:string[] = [];
-
-const getSuvFactor = (dd: MyDataSet[]) => {
-
-    log = [];
-
-    const d = dd[0];
-    let constant = 1;
-    // let text = "";
-    const unit = d.string("x00541001");
-    log.push("unit: "+unit);
-    const bw = d.floatString("x00101030");
-    log.push("bw: " + bw);
-    const pf = d.floatString("x70531000");
-    log.push("philips factor: " + pf);
-
-    if ((unit!.toLowerCase() == "bq/cc" || unit?.toLowerCase() == "bqml")
-        && getCorrectedDosage(dd) != 0 && bw != 0){
-            constant = 1.0 / getBqmlPerSuv(dd, bw!);
-            log.push("constant "+constant);
-    }else if (unit == "CNTS" && pf != null){
-        constant = Number(pf);
-    }
-
-    console.log(log);
-
-    return constant;
-}
-
-const parseSecond6digits = (str:string) => {
-    const h = Number(str.substring(0,2));
-    const m = Number(str.substring(2,4));
-    const s = Number(str.substring(4,6));
-    return h*3600+m*60+s;
-}
-
-const getCorrectedDosage = (dd: MyDataSet[]) => {
-    const d = dd[0];
-
-    let hl = d.floatString("x00181075"); // half life
-    if (hl == null){
-        hl = d.elements.x00540016.items![0].dataSet!.floatString("x00181075") // ネスト
-    }
-    log.push("half life "+hl);
-
-    const dc = d.string("x00541102"); // decay correction
-    let dosage = d.floatString("x00181074"); // radionuclide total dose
-    if (dosage == null){
-        dosage = d.elements.x00540016.items![0].dataSet!.floatString("x00181074") // ネスト
-    }
-    log.push("dosage (uncorrected) "+dosage);
-
-    if (dc!.startsWith("START")){
-
-        //2024/5/13 本来はすべてのDICOMファイルのscanstarttimeを調べてearliestのものを採択すべきである
-        const scanstarttime_ = d.string("x00080032");
-        log.push("scanstarttime "+scanstarttime_);
-        const scanstarttime = parseSecond6digits(scanstarttime_!); // acuisition time
-
-        let dosestarttime_ = d.string("x00181072"); // Radiopharmaceutical Start Time
-        if (dosestarttime_ == null){
-            dosestarttime_ = d.elements.x00540016.items![0].dataSet!.string("x00181072") // ネスト
-        }
-        log.push("dosestarttime "+dosestarttime_);
-        const dosestarttime = parseSecond6digits(dosestarttime_!)
-
-        dosage! *= Math.pow(0.5, (scanstarttime - dosestarttime) / hl!);
-        log.push("dosage (corrected) "+dosage);
-    }
-    return dosage!;
+// HHMMSS[.FFFFFF] → 0時0分0秒からの秒数 (主に metadata 用、計算には Date を使用)
+const parseSecond6digits = (str: string): number => {
+    const t = str.trim();
+    const h = Number(t.substring(0, 2));
+    const m = Number(t.substring(2, 4));
+    const s = Number(t.substring(4, 6));
+    return h * 3600 + m * 60 + s;
 };
 
-const getBqmlPerSuv = (dd: MyDataSet[], bw:number) => {
-    return getCorrectedDosage(dd) / (bw * 1000);
+// DICOM DA: "YYYYMMDD" → {y, m, d}
+const parseDicomDate = (s: string | null | undefined): { y: number; m: number; d: number } | null => {
+    if (!s) return null;
+    const t = s.trim();
+    if (t.length < 8) return null;
+    const y = Number(t.slice(0, 4));
+    const m = Number(t.slice(4, 6));
+    const d = Number(t.slice(6, 8));
+    if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d) || y < 1900) return null;
+    return { y, m, d };
+};
+
+// DICOM TM: "HHMMSS[.FFFFFF]"
+const parseDicomTime = (s: string | null | undefined): { h: number; m: number; s: number; ms: number } | null => {
+    if (!s) return null;
+    const t = s.trim();
+    if (t.length < 4) return null;
+    const h = Number(t.slice(0, 2));
+    const m = Number(t.slice(2, 4));
+    const sec = t.length >= 6 ? Number(t.slice(4, 6)) : 0;
+    let ms = 0;
+    const dot = t.indexOf('.');
+    if (dot >= 0) {
+        const frac = t.slice(dot + 1);
+        if (frac) ms = Math.round(Number('0.' + frac) * 1000);
+    }
+    if (!Number.isFinite(h) || !Number.isFinite(m) || !Number.isFinite(sec)) return null;
+    return { h, m, s: sec, ms };
+};
+
+// DICOM DT: "YYYYMMDDHHMMSS[.FFFFFF][&ZZXX]"
+const parseDicomDateTime = (s: string | null | undefined): Date | null => {
+    if (!s) return null;
+    const t = s.trim().replace(/[+-]\d{4}$/, ''); // タイムゾーン suffix は無視
+    if (t.length < 8) return null;
+    const ymd = parseDicomDate(t.slice(0, 8));
+    if (!ymd) return null;
+    const tt = t.length > 8 ? parseDicomTime(t.slice(8)) : { h: 0, m: 0, s: 0, ms: 0 };
+    if (!tt) return null;
+    return new Date(Date.UTC(ymd.y, ymd.m - 1, ymd.d, tt.h, tt.m, tt.s, tt.ms));
+};
+
+const combineDateAndTime = (
+    dateStr: string | null | undefined,
+    timeStr: string | null | undefined,
+): Date | null => {
+    const ymd = parseDicomDate(dateStr ?? null);
+    const tt = parseDicomTime(timeStr ?? null);
+    if (!ymd || !tt) return null;
+    return new Date(Date.UTC(ymd.y, ymd.m - 1, ymd.d, tt.h, tt.m, tt.s, tt.ms));
+};
+
+// Series 全 DICOM を走査し、最も早い acquisition datetime を返す。
+// 優先順位: AcquisitionDateTime > AcquisitionDate+Time > SeriesDate+Time。
+const findEarliestAcquisitionDateTime = (dd: MyDataSet[]): Date | null => {
+    let best: Date | null = null;
+    const consider = (dt: Date | null) => {
+        if (dt && (!best || dt < best)) best = dt;
+    };
+    for (const d of dd) {
+        consider(parseDicomDateTime(d.string("x0008002a")));               // AcquisitionDateTime
+        consider(combineDateAndTime(d.string("x00080022"), d.string("x00080032"))); // AcqDate + AcqTime
+        consider(combineDateAndTime(d.string("x00080021"), d.string("x00080031"))); // SeriesDate + SeriesTime
+    }
+    return best;
+};
+
+// RadiopharmaceuticalInformationSequence (0054,0016) の最初の item
+const getRadiopharmSeq = (d: MyDataSet) => {
+    return d.elements.x00540016?.items?.[0]?.dataSet ?? null;
+};
+
+const getRadioFloat = (d: MyDataSet, tag: string): number | null => {
+    let v = d.floatString(tag);
+    if (v == null) {
+        const seq = getRadiopharmSeq(d);
+        if (seq) v = seq.floatString(tag);
+    }
+    return v ?? null;
+};
+
+const getRadioStr = (d: MyDataSet, tag: string): string | null => {
+    let v = d.string(tag);
+    if (v == null) {
+        const seq = getRadiopharmSeq(d);
+        if (seq) v = seq.string(tag);
+    }
+    return v ?? null;
+};
+
+// 注射 datetime: RadiopharmaceuticalStartDateTime (combined) → StartTime + acq date
+const getInjectionDateTime = (d: MyDataSet, acqFallback: Date): Date | null => {
+    const rdt = getRadioStr(d, "x00181078"); // RadiopharmaceuticalStartDateTime (DT)
+    const parsed = parseDicomDateTime(rdt);
+    if (parsed) return parsed;
+
+    const rtime = getRadioStr(d, "x00181072"); // RadiopharmaceuticalStartTime (TM)
+    const tt = parseDicomTime(rtime);
+    if (tt) {
+        return new Date(Date.UTC(
+            acqFallback.getUTCFullYear(),
+            acqFallback.getUTCMonth(),
+            acqFallback.getUTCDate(),
+            tt.h, tt.m, tt.s, tt.ms,
+        ));
+    }
+    return null;
+};
+
+const tryBqmlSuvFactor = (dd: MyDataSet[]): SuvResult => {
+    const d = dd[0];
+    const unitRaw = (d.string("x00541001") ?? "").trim();
+    const unit = unitRaw.toUpperCase();
+    if (unit !== "BQML" && unit !== "BQ/CC" && unit !== "BQM") {
+        return { factor: 1, ok: false, reason: `units not BQML: "${unitRaw}"`, source: 'none' };
+    }
+
+    const bw = d.floatString("x00101030");
+    if (bw == null || Number(bw) <= 0) {
+        return { factor: 1, ok: false, reason: 'missing or invalid PatientWeight', source: 'none' };
+    }
+
+    const hl = getRadioFloat(d, "x00181075");
+    if (hl == null || Number(hl) <= 0) {
+        return { factor: 1, ok: false, reason: 'missing or invalid radionuclide half-life', source: 'none' };
+    }
+
+    const dose = getRadioFloat(d, "x00181074");
+    if (dose == null || Number(dose) <= 0) {
+        return { factor: 1, ok: false, reason: 'missing or invalid radionuclide total dose', source: 'none' };
+    }
+
+    const acq_dt = findEarliestAcquisitionDateTime(dd);
+    if (!acq_dt) {
+        return { factor: 1, ok: false, reason: 'missing acquisition date/time', source: 'none' };
+    }
+
+    const inj_dt = getInjectionDateTime(d, acq_dt);
+    if (!inj_dt) {
+        return { factor: 1, ok: false, reason: 'missing radiopharmaceutical start time', source: 'none' };
+    }
+
+    const dt_sec = (acq_dt.getTime() - inj_dt.getTime()) / 1000;
+    const dc = (d.string("x00541102") ?? "").toUpperCase().trim();
+
+    // DecayCorrection の解釈:
+    //   START : pixel は scan start 基準で decay-corrected → dose を inj→acq に decay
+    //   ADMIN : pixel は admin (inj) 基準で decay-corrected → dose は raw (decay 不要)
+    //   NONE  : pixel は acq 時の活性 (補正なし)            → dose を inj→acq に decay
+    //   missing: START と仮定 (もっとも一般的)
+    let dose_at_ref: number;
+    if (dc === "ADMIN") {
+        dose_at_ref = Number(dose);
+    } else {
+        if (dt_sec < 0) {
+            return {
+                factor: 1, ok: false,
+                reason: `acquisition before injection (dt=${dt_sec.toFixed(0)}s) — bad date/time?`,
+                source: 'none',
+                acquisitionDt: acq_dt, injectionDt: inj_dt, decayCorrection: dc || undefined,
+            };
+        }
+        const decay = Math.pow(0.5, dt_sec / Number(hl));
+        dose_at_ref = Number(dose) * decay;
+    }
+
+    if (!Number.isFinite(dose_at_ref) || dose_at_ref <= 0) {
+        return { factor: 1, ok: false, reason: 'computed dose_at_ref invalid', source: 'none' };
+    }
+
+    const factor = (Number(bw) * 1000.0) / dose_at_ref;
+    return {
+        factor, ok: true, reason: 'ok', source: 'BQML',
+        acquisitionDt: acq_dt, injectionDt: inj_dt, decayCorrection: dc || undefined,
+    };
+};
+
+// メイン: BQML → DecayFactor タグ → Philips factor → CNTS+Philips → 失敗。
+// PET volume 構築時に **必ず** 1 回呼ばれ、失敗時も factor=1 で fall-through (raw 値のまま表示) する。
+const getSuvFactor = (dd: MyDataSet[]): SuvResult => {
+    const d = dd[0];
+    const unitRaw = (d.string("x00541001") ?? "").trim();
+    const unit = unitRaw.toUpperCase();
+
+    if (unit.includes("SUV")) {
+        return { factor: 1, ok: true, reason: 'units already SUV', source: 'units_already_SUV' };
+    }
+
+    // Path A: Units = CNTS は Philips factor が "本来の" 計算経路。
+    // (Philips PET の生 raw データ単位。BQML 計算は無関係なので最初に判定する)
+    if (unit === "CNTS") {
+        const pf = d.floatString("x70531000");
+        if (pf != null && Number(pf) > 0) {
+            return { factor: Number(pf), ok: true, reason: 'CNTS units, Philips SUV factor', source: 'CNTS_Philips' };
+        }
+        return { factor: 1, ok: false, reason: 'CNTS units but no Philips factor (7053,1000)', source: 'none' };
+    }
+
+    // Path B: BQML 標準計算
+    const bqml = tryBqmlSuvFactor(dd);
+    if (bqml.ok) return bqml;
+
+    // Path C: DecayFactor タグ (0054,1321) フォールバック
+    //   注射時刻が欠損していても、メーカが事前計算済みの DecayFactor で代替できることがある。
+    if (unit === "BQML" || unit === "BQ/CC" || unit === "BQM") {
+        const df = d.floatString("x00541321");
+        const bw = d.floatString("x00101030");
+        const dose = getRadioFloat(d, "x00181074");
+        if (df != null && bw != null && dose != null && Number(df) > 0 && Number(bw) > 0 && Number(dose) > 0) {
+            const dose_at_acq = Number(dose) * Number(df);
+            if (dose_at_acq > 0) {
+                return {
+                    factor: (Number(bw) * 1000.0) / dose_at_acq,
+                    ok: true, reason: 'used DICOM DecayFactor tag', source: 'DecayFactor',
+                };
+            }
+        }
+    }
+
+    // Path D: BQML 失敗 + Manufacturer=PHILIPS の場合は Philips proprietary factor (7053,1000)
+    const manuf = (d.string("x00080070") ?? "").toUpperCase();
+    if (manuf.includes("PHILIPS")) {
+        const pf = d.floatString("x70531000");
+        if (pf != null && Number(pf) > 0) {
+            return { factor: Number(pf), ok: true, reason: `BQML failed (${bqml.reason}); used Philips factor`, source: 'Philips' };
+        }
+    }
+
+    return { factor: 1, ok: false, reason: bqml.reason, source: 'none' };
 };
 
 

@@ -10,6 +10,12 @@ import { ref, onMounted} from 'vue';
 import * as THREE from 'three';
 
 
+interface ClutLegendProp {
+  gradient: string;
+  minLabel: string;
+  maxLabel: string;
+}
+
 const prop = defineProps<{
   width: number;
   height: number;
@@ -18,16 +24,23 @@ const prop = defineProps<{
   modalityLabel?: string;
   description?: string;
   boxKind?: 'dicom' | 'volume' | 'fusion' | 'mip';
-  currentPlane?: 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | null;
+  currentPlane?: 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | 'vr' | null;
   currentClut?: number;
   syncEnabled?: boolean;
   globalSyncOn?: boolean;
+  // Color scale legend (canvas 右下に半透明 overlay)。
+  // legend = 主レイヤ (Volume なら唯一、Fusion なら CT)、legend2 = Fusion の PET レイヤ。
+  legend?: ClutLegendProp;
+  legend2?: ClutLegendProp;
+  // Crosshair (canvas 上の screen 座標 px)。null/undefined なら描画しない。
+  crosshairX?: number | null;
+  crosshairY?: number | null;
 }>();
 
 const emit = defineEmits<{
   (e: 'closeBox'): void;
   (e: 'resetView'): void;
-  (e: 'setPlane', plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip'): void;
+  (e: 'setPlane', plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | 'vr'): void;
   (e: 'setClut', clutIdx: number): void;
   (e: 'toggleSync'): void;
   (e: 'maximize'): void;
@@ -43,6 +56,7 @@ const planeItems = [
   { id: 'sag',  label: 'Sagittal' },
   { id: 'mip',  label: 'MIP' },
   { id: 'smip', label: 'sMIP' },
+  { id: 'vr',   label: 'Volume Rendering' },
 ] as const;
 
 // CLUT id は DicomView 側の switchTo* と一致 (Mono=0, Rainbow=2, Hot=4)。
@@ -228,7 +242,8 @@ export interface MaskOverlay {
 const drawNiftiSlice = async function(pix: Float32Array | Int16Array,
     nx:number, ny:number, nz:number, wc:number, ww:number,
     p00:THREE.Vector3, v01:THREE.Vector3,v10:THREE.Vector3, clut: number[][],
-    overlay?: MaskOverlay) {
+    overlay?: MaskOverlay,
+    bodyMask?: Uint8Array) {     // CT 寝台除去用 body mask (0=体外, 1=体内)
 
       if (cv1.value === null || ctx === null) return;
       isEmpty.value = false;
@@ -244,7 +259,14 @@ const drawNiftiSlice = async function(pix: Float32Array | Int16Array,
 
           // trilinear sampling: 低解像 PET を高解像 box に表示するときに滑らか。
           // 範囲外なら null を返し、既存の clut[0] フォールバックを使う。
-          const raw = sampleTrilinear(pix, nx, ny, nz, v.x, v.y, v.z);
+          let raw = sampleTrilinear(pix, nx, ny, nz, v.x, v.y, v.z);
+          // CT 寝台除去: bodyMask が定義されていて当該 voxel が体外なら -1024 で塗り潰す
+          if (raw != null && bodyMask){
+            const bx = Math.floor(v.x), by = Math.floor(v.y), bz = Math.floor(v.z);
+            if (bx >= 0 && bx < nx && by >= 0 && by < ny && bz >= 0 && bz < nz){
+              if (bodyMask[bz*nx*ny + by*nx + bx] === 0) raw = -1024;
+            }
+          }
           if (raw != null){
             let p = Math.floor((raw-(wc-ww/2)) * (255/ww));
             if (p<0) p=0;
@@ -288,6 +310,7 @@ const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
     nx1:number, ny1:number, nz1:number, wc1:number, ww1:number,
     p00_1:THREE.Vector3, v01_1:THREE.Vector3,v10_1:THREE.Vector3, clut1: number[][],
     overlay?: MaskOverlay,
+    bodyMask?: Uint8Array,    // CT 寝台除去用 (pix0=CT 想定)
   ) {
 
       if (cv1.value === null || ctx === null) return;
@@ -307,7 +330,11 @@ const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
           const v0_1 = v_1.clone().floor();
 
           if (v0_0.x >= 0 && v0_0.x < nx0 && v0_0.y >= 0 && v0_0.y < ny0 && v0_0.z >= 0 && v0_0.z < nz0){
-            const raw = pix0[ny0*nx0*v0_0.z+nx0*v0_0.y+v0_0.x];
+            let raw = pix0[ny0*nx0*v0_0.z+nx0*v0_0.y+v0_0.x];
+            // CT 寝台除去: bodyMask が定義されていて当該 voxel が体外なら -1024
+            if (bodyMask && bodyMask[ny0*nx0*v0_0.z+nx0*v0_0.y+v0_0.x] === 0){
+              raw = -1024;
+            }
             let p = Math.floor((raw-(wc0-ww0/2)) * (255/ww0));
             if (p<0) p=0;
             if (p>255) p=255;
@@ -365,7 +392,8 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
     nx:number, ny:number, nz:number, wc:number, ww:number,
     p00:THREE.Vector3, v01:THREE.Vector3,v10:THREE.Vector3,
     angle:number, thresh:number, depth:number, clut: number[][], isSurface: boolean,
-    overlay?: MaskOverlay) {
+    overlay?: MaskOverlay,
+    fast: boolean = false) {
 
       const time0 = performance.now();
 
@@ -386,16 +414,16 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
       const s = Math.sin((angle-90) *3.1415926535 / 180);
       const c = Math.cos((angle-90) *3.1415926535 / 180);
 
-      // const isSurface = true;
-      // const thresh = 0.5;
-      // const depth = 3;
+      // fast mode: precompute を (j,k) stride=2 で走らせ、未計算位置はあとで近傍コピー。
+      // 144³ PET でだいたい 4x speedup。停止後 idle で full-res 再描画される運用前提。
+      const stride = fast ? 2 : 1;
 
       const time1 = performance.now();
 
 
       if (!isSurface){
-        for (let k = 0; k<nz; k++){
-          for (let j = 0; j<ny; j++){
+        for (let k = 0; k<nz; k += stride){
+          for (let j = 0; j<ny; j += stride){
             let m = -Infinity;
             let lid = 0;
             const j0 = j - ny/2;
@@ -420,8 +448,8 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
           }
         }
       }else{
-        for (let k = 0; k<nz; k++){
-          for (let j = 0; j<ny; j++){
+        for (let k = 0; k<nz; k += stride){
+          for (let j = 0; j<ny; j += stride){
             let m = -Infinity;
             let lid = 0;
             const j0 = j - ny/2;
@@ -452,6 +480,19 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
             }
             mipData[k*ny+j] = m;
             if (mipMaskData) mipMaskData[k*ny+j] = lid;
+          }
+        }
+      }
+
+      // fast mode: スキップした (j,k) を最寄りの計算済みセル値でフィル
+      if (stride > 1){
+        for (let k = 0; k < nz; k++){
+          const k0 = k - (k % stride);
+          for (let j = 0; j < ny; j++){
+            if ((k % stride) === 0 && (j % stride) === 0) continue;
+            const j0 = j - (j % stride);
+            mipData[k*ny+j] = mipData[k0*ny+j0];
+            if (mipMaskData) mipMaskData[k*ny+j] = mipMaskData[k0*ny+j0];
           }
         }
       }
@@ -506,6 +547,112 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
 
   void isSurface;
 }
+
+
+// Volume Rendering (Phase 1): front-to-back ray casting + ramp opacity transfer function。
+// drawNiftiMip と同じ pattern (precompute → canvas read) で、max ではなく compositing。
+// fast=true で stride=2 (4x speedup)、idle で full-res 再描画する想定 (DicomView 側で制御)。
+const drawNiftiVR = async function(pix: Float32Array | Int16Array,
+    nx: number, ny: number, nz: number, wc: number, ww: number,
+    p00: THREE.Vector3, v01: THREE.Vector3, v10: THREE.Vector3,
+    angle: number, clut: number[][],
+    fast: boolean = false) {
+
+      if (cv1.value === null || ctx === null) return;
+      isEmpty.value = false;
+      const canvasx = cv1.value.width;
+      const canvasy = cv1.value.height;
+      const myImageData = ctx.getImageData(0, 0, canvasx, canvasy);
+
+      // Pre-compute: 各 (k, j) に対し ray-cast → RGBA composite を vrData に
+      const vrData = new Uint8ClampedArray(ny * nz * 4);
+
+      const s = Math.sin((angle - 90) * Math.PI / 180);
+      const c = Math.cos((angle - 90) * Math.PI / 180);
+
+      const stride = fast ? 2 : 1;
+      const lo = wc - ww / 2;
+      const range = ww;
+      const ALPHA_SCALE = 0.06;  // 透明感の調整 (大きいほど不透明)
+
+      for (let k = 0; k < nz; k += stride) {
+        for (let j = 0; j < ny; j += stride) {
+          let dr = 0, dg = 0, db = 0, da = 0;
+          const j0 = j - ny / 2;
+          // Front-to-back: i = 0 → nx-1 (viewer から奥へ)
+          for (let i = 0; i < nx; i++) {
+            const i0 = i - nx / 2;
+            const x = Math.floor(i0 * c - j0 * s) + nx / 2;
+            const y = Math.floor(i0 * s + j0 * c) + ny / 2;
+            if (x < 0 || x >= nx || y < 0 || y >= ny) continue;
+            const v = pix[k * nx * ny + y * nx + x];
+            let p = (v - lo) / range;
+            if (p < 0) continue;
+            if (p > 1) p = 1;
+            // Ramp opacity transfer function
+            const alpha = p * ALPHA_SCALE;
+            if (alpha < 0.002) continue;
+            const cidx = Math.min(255, Math.floor(p * 255));
+            const cr = clut[cidx][0], cg = clut[cidx][1], cb = clut[cidx][2];
+            // Front-to-back composite: dst += transmit * α * src; transmit = 1 - dst.α
+            const transmit = 1 - da;
+            dr += transmit * alpha * cr;
+            dg += transmit * alpha * cg;
+            db += transmit * alpha * cb;
+            da += transmit * alpha;
+            if (da > 0.99) break;  // early exit
+          }
+          const idx = (k * ny + j) * 4;
+          vrData[idx]     = dr;
+          vrData[idx + 1] = dg;
+          vrData[idx + 2] = db;
+          vrData[idx + 3] = Math.min(255, da * 255);
+        }
+      }
+
+      // fast mode の gap fill (近傍コピー)
+      if (stride > 1) {
+        for (let k = 0; k < nz; k++) {
+          const k0 = k - (k % stride);
+          for (let j = 0; j < ny; j++) {
+            if ((k % stride) === 0 && (j % stride) === 0) continue;
+            const j0 = j - (j % stride);
+            const src = (k0 * ny + j0) * 4;
+            const dst = (k * ny + j) * 4;
+            vrData[dst]     = vrData[src];
+            vrData[dst + 1] = vrData[src + 1];
+            vrData[dst + 2] = vrData[src + 2];
+            vrData[dst + 3] = vrData[src + 3];
+          }
+        }
+      }
+
+      // Canvas pixel render (MIP と同じ index 形式)
+      let ad = 0;
+      for (let i = 0; i < canvasy; i++) {
+        let v = p00.clone().addScaledVector(v01, i);
+        for (let j = 0; j < canvasx; j++) {
+          const v0 = v.clone().floor();
+          if (v0.x >= 0 && v0.x < nx && v0.y >= 0 && v0.y < ny && v0.z >= 0 && v0.z < nz) {
+            const src = (nx * v0.z + v0.x) * 4;
+            myImageData.data[ad]     = vrData[src];
+            myImageData.data[ad + 1] = vrData[src + 1];
+            myImageData.data[ad + 2] = vrData[src + 2];
+            myImageData.data[ad + 3] = 255;
+          } else {
+            myImageData.data[ad]     = 0;
+            myImageData.data[ad + 1] = 0;
+            myImageData.data[ad + 2] = 0;
+            myImageData.data[ad + 3] = 255;
+          }
+          ad += 4;
+          v.add(v10);
+        }
+      }
+
+      ctx.putImageData(myImageData, 0, 0, 0, 0, canvasx, canvasy);
+}
+
 
 
 
@@ -686,7 +833,7 @@ const drawPolygonOverlay = (vertices: Array<[number, number]>, mode: 'add' | 'er
 };
 
 defineExpose({init, show, show2, showRgb, showDirect,
-   drawNiftiSlice, drawNiftiSliceFusion, drawNiftiMip, clear,
+   drawNiftiSlice, drawNiftiSliceFusion, drawNiftiMip, drawNiftiVR, clear,
    drawSphereOverlay, drawPolygonOverlay});
 
 </script>
@@ -797,6 +944,34 @@ defineExpose({init, show, show2, showRgb, showDirect,
                 <v-icon icon="mdi-image-off-outline" size="48" />
                 <span>{{ emptyText }}</span>
             </div>
+            <!-- Crosshair overlay (segStore.crosshairWorld を screen に project した位置) -->
+            <svg
+                v-if="prop.crosshairX != null && prop.crosshairY != null"
+                class="mv-crosshair"
+                :viewBox="`0 0 ${prop.width} ${prop.height}`"
+                :width="prop.width"
+                :height="prop.height"
+                preserveAspectRatio="none"
+            >
+                <line :x1="prop.crosshairX" y1="0" :x2="prop.crosshairX" :y2="prop.height"
+                      stroke="#00D4AA" stroke-width="0.8" stroke-dasharray="4 3" opacity="0.85" />
+                <line x1="0" :y1="prop.crosshairY" :x2="prop.width" :y2="prop.crosshairY"
+                      stroke="#00D4AA" stroke-width="0.8" stroke-dasharray="4 3" opacity="0.85" />
+                <circle :cx="prop.crosshairX" :cy="prop.crosshairY" r="3"
+                        stroke="#00D4AA" stroke-width="1" fill="rgba(0,0,0,0.4)" />
+            </svg>
+
+            <!-- Color scale legend (Volume / Fusion / MIP のみ) -->
+            <div v-if="prop.legend" class="mv-clut-legend">
+                <span class="mv-clut-min">{{ prop.legend.minLabel }}</span>
+                <div class="mv-clut-bar" :style="{ background: prop.legend.gradient }"></div>
+                <span class="mv-clut-max">{{ prop.legend.maxLabel }}</span>
+            </div>
+            <div v-if="prop.legend2" class="mv-clut-legend mv-clut-legend--second">
+                <span class="mv-clut-min">{{ prop.legend2.minLabel }}</span>
+                <div class="mv-clut-bar" :style="{ background: prop.legend2.gradient }"></div>
+                <span class="mv-clut-max">{{ prop.legend2.maxLabel }}</span>
+            </div>
         </div>
     </div>
 
@@ -892,6 +1067,48 @@ defineExpose({init, show, show2, showRgb, showDirect,
 }
 .mv-canvas {
   display: block;
+}
+
+/* Crosshair (絶対位置で canvas 上に重ねる、events スルー) */
+.mv-crosshair {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Color scale legend (CLUT bar + min/max labels) */
+.mv-clut-legend {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 3px 6px;
+  border-radius: 3px;
+  pointer-events: none;
+  user-select: none;
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+  font-size: 10px;
+  color: #fff;
+  letter-spacing: 0.02em;
+}
+.mv-clut-legend--second {
+  bottom: 30px;  /* 1 段目 (CT) の上に積む */
+}
+.mv-clut-bar {
+  width: 100px;
+  height: 8px;
+  border-radius: 1px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+.mv-clut-min, .mv-clut-max {
+  font-feature-settings: 'tnum';
+  white-space: nowrap;
+  min-width: 32px;
+  text-align: center;
 }
 
 /* Empty state: centered icon + dim caption */

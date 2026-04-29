@@ -36,6 +36,8 @@ export type VolumeImageBoxInfo = ImageBoxInfoBase & {
         thresholdSurfaceMip: number,
         depthSurfaceMip: number
     } | null,
+    // Volume Rendering (front-to-back composite)。MIP/sMIP と排他: isVr=true のとき isMip=false
+    isVr?: boolean,
 }
 
 export type FusedVolumeImageBoxInfo = VolumeImageBoxInfo & {

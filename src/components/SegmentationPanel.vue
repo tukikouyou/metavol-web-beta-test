@@ -1,9 +1,33 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, onMounted, onUnmounted } from 'vue';
+import * as THREE from 'three';
 import { useSegmentationStore } from '../stores/segmentation';
 import { readNiftiMask } from './segmentation/niftiReader';
+import { summarizeLesions, type LesionStat } from './segmentation/maskOps';
+import { triggerDownload } from './segmentation/niftiWriter';
+import { applyRigidToVolume, type RegistrationSnapshot } from './registration/transform';
+import { registerMrToPt } from './registration/registerMrPt';
 
 const store = useSegmentationStore();
+
+// Auto-saved relative time, refreshed every 5s so the label stays current.
+const nowTick = ref(Date.now());
+let nowTimer: ReturnType<typeof setInterval> | null = null;
+onMounted(() => { nowTimer = setInterval(() => { nowTick.value = Date.now(); }, 5000); });
+onUnmounted(() => { if (nowTimer) clearInterval(nowTimer); });
+
+const autoSavedRel = computed(() => {
+    const ts = store.lastAutoSavedAt;
+    if (ts == null) return '';
+    const dt = Math.max(0, nowTick.value - ts);
+    const sec = Math.floor(dt / 1000);
+    if (sec < 5) return 'just now';
+    if (sec < 60) return `${sec}s ago`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min} min ago`;
+    const hr = Math.floor(min / 60);
+    return `${hr} h ago`;
+});
 
 const emit = defineEmits<{
     (e: 'redraw'): void;
@@ -147,6 +171,78 @@ const onFindIslands = () => {
     emit('redraw');
 };
 
+const formatMm = (v: number) => v.toFixed(1);
+const formatDeg = (v: number) => (v * 180 / Math.PI).toFixed(1);
+
+const onRegisterMrPt = async () => {
+    const pt = store.petVolumeRef;
+    const mr = store.mrVolumeRef;
+    if (!pt || !mr) {
+        alert('PT and MR volumes are both required for registration.');
+        return;
+    }
+    // snapshot 確保 (初回 or 既に存在)
+    store.ensureMrRegistrationSnapshot();
+    const snap = store.mrRegistrationSnapshot as RegistrationSnapshot;
+    if (!snap) { alert('Could not capture MR snapshot.'); return; }
+    // snapshot から原状復元してから最適化開始 (既存 transform は破棄)
+    applyRigidToVolume(mr, snap, [0, 0, 0, 0, 0, 0]);
+    store.setMrRegistrationParams(null);
+    store.setMrRegistrationInProgress(true);
+    store.setMrRegistrationProgress(null);
+
+    // setTimeout でブラウザにレンダー機会を渡してから heavy 計算開始
+    await new Promise(r => setTimeout(r, 30));
+    try {
+        const res = registerMrToPt(
+            pt, mr,
+            [0, 0, 0, 0, 0, 0],
+            (info) => {
+                store.setMrRegistrationProgress({
+                    level: info.level, nLevels: info.nLevels,
+                    iter: info.iter, mi: info.bestNegMI,
+                });
+            },
+        );
+        // 最適パラメータを MR に適用
+        applyRigidToVolume(mr, snap, res.params);
+        store.setMrRegistrationParams(res.params as [number, number, number, number, number, number]);
+        console.log(`[mr-pt-reg] done in ${res.elapsedMs.toFixed(0)}ms, ${res.iterationsTotal} iters, MI=${(-res.finalNegMI).toFixed(4)}`);
+        emit('redraw');
+    } catch (err: any) {
+        console.error('[mr-pt-reg] failed', err);
+        alert('Registration failed: ' + (err?.message ?? err));
+    } finally {
+        store.setMrRegistrationInProgress(false);
+    }
+};
+
+const onResetRegistration = () => {
+    const mr = store.mrVolumeRef;
+    const snap = store.mrRegistrationSnapshot as RegistrationSnapshot | null;
+    if (mr && snap) applyRigidToVolume(mr, snap, [0, 0, 0, 0, 0, 0]);
+    store.setMrRegistrationParams(null);
+    store.setMrRegistrationProgress(null);
+    emit('redraw');
+};
+
+const onComputeBodyMask = () => {
+    const ok = store.computeCtBodyMask(-300);
+    if (!ok) {
+        alert('No CT volume loaded.');
+        return;
+    }
+    emit('redraw');
+};
+const onToggleBodyMask = () => {
+    store.toggleCtBodyMaskEnabled();
+    emit('redraw');
+};
+const onClearBodyMask = () => {
+    store.clearCtBodyMask();
+    emit('redraw');
+};
+
 const onSave = () => {
     store.saveMaskAsNifti();
 };
@@ -233,6 +329,121 @@ const onLoadMaskFiles = async (e: Event) => {
     }
 };
 
+// ===== Lesion table =====
+// finalMask の 26-CC を 1 病変として SUVmax / SUVmean / MTV / TLG / centroid を集計。
+// maskVersion に依存して reactive 更新。3M voxel ≒ 30 ms 想定なので click→Apply 直後でも許容範囲。
+interface LesionRow extends LesionStat {
+    colorCss: string;
+}
+
+const lesionRows = computed<LesionRow[]>(() => {
+    void store.maskVersion;
+    const pet = store.petVolumeRef;
+    const mask = store.finalMask;
+    if (!pet || !mask) return [];
+    const stats = summarizeLesions(pet, mask, store.labels);
+    const colorById = new Map<number, [number, number, number]>();
+    for (const l of store.labels) colorById.set(l.id, l.color);
+    return stats.map(s => {
+        const c = colorById.get(s.labelId) ?? [180, 180, 180];
+        return { ...s, colorCss: `rgb(${c[0]},${c[1]},${c[2]})` };
+    });
+});
+
+const onJumpToLesion = (l: LesionRow) => {
+    const p = new THREE.Vector3(l.centroidWorld[0], l.centroidWorld[1], l.centroidWorld[2]);
+    store.setCrosshairWorld(p);
+    emit('redraw');
+};
+
+const onExportLesionCsv = () => {
+    const rows = lesionRows.value;
+    if (rows.length === 0) return;
+    const esc = (s: string) => `"${s.replace(/"/g, '""')}"`;
+    const headers = [
+        '#', 'Label', 'SUVmax', 'SUVmean', 'MTV_cc', 'TLG',
+        'VoxelCount', 'Centroid_x_mm', 'Centroid_y_mm', 'Centroid_z_mm',
+    ];
+    const lines = [headers.join(',')];
+    rows.forEach((l, i) => {
+        lines.push([
+            String(i + 1),
+            esc(l.labelName),
+            l.suvMax.toFixed(4),
+            l.suvMean.toFixed(4),
+            l.mtvCc.toFixed(4),
+            l.tlg.toFixed(4),
+            String(l.voxelCount),
+            l.centroidWorld[0].toFixed(2),
+            l.centroidWorld[1].toFixed(2),
+            l.centroidWorld[2].toFixed(2),
+        ].join(','));
+    });
+    // BOM 付き UTF-8 で Excel が文字化けしないようにする
+    const csv = '﻿' + lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+    const sid = store.petVolumeRef?.metadata?.seriesUID
+        ? store.petVolumeRef.metadata.seriesUID.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 32)
+        : 'lesions';
+    triggerDownload(blob, `${sid}_lesions_${ts}.csv`);
+};
+
+// TLG / MTV は値の幅が大きいので桁数に応じて表示を切替
+const fmtTlg = (v: number): string => {
+    if (!Number.isFinite(v)) return '';
+    if (v >= 10000) return (v / 1000).toFixed(1) + 'k';
+    if (v >= 1000) return (v / 1000).toFixed(2) + 'k';
+    if (v >= 100) return v.toFixed(0);
+    return v.toFixed(1);
+};
+const fmtMtv = (v: number): string => {
+    if (!Number.isFinite(v)) return '';
+    if (v >= 100) return v.toFixed(0);
+    if (v >= 10) return v.toFixed(1);
+    return v.toFixed(2);
+};
+
+// 全病変の合計 (footer 表示用)
+const lesionTotals = computed(() => {
+    const rows = lesionRows.value;
+    if (rows.length === 0) return null;
+    let totalMtv = 0, totalTlg = 0, totalVox = 0, maxSuv = 0;
+    for (const r of rows) {
+        totalMtv += r.mtvCc;
+        totalTlg += r.tlg;
+        totalVox += r.voxelCount;
+        if (r.suvMax > maxSuv) maxSuv = r.suvMax;
+    }
+    return { count: rows.length, totalMtv, totalTlg, totalVox, maxSuv };
+});
+
+// SUV 警告: PET volume の metadata に suvOk=false が立っているとき、
+// 失敗理由を Inspector の上部に黄色バナーで通知する。
+// suvFactor=1 (= raw 値表示) で fall-through していることを user に明示することが目的。
+const suvWarning = computed<{ reason: string; source: string } | null>(() => {
+    const md = store.petVolumeRef?.metadata;
+    if (!md) return null;
+    if (md.suvOk === false && md.suvReason) {
+        return { reason: md.suvReason, source: md.suvSource ?? 'none' };
+    }
+    return null;
+});
+
+// SUV 採用パスを Inspector に表示するための短い説明文 (ok のときのみ)
+const suvOkLabel = computed<string | null>(() => {
+    const md = store.petVolumeRef?.metadata;
+    if (!md || md.suvOk !== true) return null;
+    switch (md.suvSource) {
+        case 'BQML': return 'SUVbw (DICOM BQML)';
+        case 'DecayFactor': return 'SUVbw (DecayFactor fallback)';
+        case 'Philips': return 'SUVbw (Philips factor fallback)';
+        case 'CNTS_Philips': return 'SUVbw (Philips CNTS factor)';
+        case 'units_already_SUV': return 'pre-computed SUV';
+        default: return null;
+    }
+});
+
 const polygonModeProxy = computed({
     get: () => store.polygon?.mode ?? store.defaultPolygonMode,
     set: (m: 'add' | 'erase') => {
@@ -258,6 +469,104 @@ const polygonModeProxy = computed({
                     {{ store.petVolumeRef.metadata?.seriesDescription ?? '(no description)' }}
                 </span>
             </div>
+
+            <!-- SUV calc status -->
+            <div v-if="suvWarning" class="mv-suv-warning" :title="`source: ${suvWarning.source}`">
+                <v-icon icon="mdi-alert" size="x-small" class="mr-1" />
+                <div class="mv-suv-warning-text">
+                    <strong>SUV not computed.</strong>
+                    Voxel values are displayed as-is.
+                    <span class="mv-suv-reason">Reason: {{ suvWarning.reason }}</span>
+                </div>
+            </div>
+            <div v-else-if="suvOkLabel" class="mv-suv-ok" :title="`source: ${store.petVolumeRef?.metadata?.suvSource}`">
+                <v-icon icon="mdi-check-circle-outline" size="x-small" class="mr-1" />
+                {{ suvOkLabel }}
+            </div>
+
+            <!-- Auto-save status -->
+            <div v-if="store.lastAutoSavedAt" class="mv-autosave-line">
+                <v-icon icon="mdi-cloud-check-outline" size="x-small" class="mr-1" />
+                Auto-saved {{ autoSavedRel }}
+            </div>
+
+            <!-- MR-PET registration (auto, MI-based) — MR + PT 両方ロード時のみ -->
+            <section v-if="store.mrVolumeRef && store.petVolumeRef" class="mv-section">
+                <div class="mv-section-title">
+                    <v-icon icon="mdi-vector-link" size="x-small" />
+                    MR-PET Registration
+                </div>
+                <div class="mv-btn-row">
+                    <v-btn
+                        size="small"
+                        variant="tonal"
+                        color="primary"
+                        :loading="store.mrRegistrationInProgress"
+                        :disabled="store.mrRegistrationInProgress"
+                        @click="onRegisterMrPt"
+                    >
+                        <v-icon icon="mdi-cog-sync" size="small" class="mr-1" />
+                        Auto Register
+                    </v-btn>
+                    <v-btn
+                        v-if="store.mrRegistrationParams"
+                        size="small"
+                        variant="text"
+                        :disabled="store.mrRegistrationInProgress"
+                        @click="onResetRegistration"
+                    >Reset</v-btn>
+                </div>
+                <div v-if="store.mrRegistrationProgress" class="mv-reg-status">
+                    Level {{ store.mrRegistrationProgress.level + 1 }}/{{ store.mrRegistrationProgress.nLevels }}
+                    · iter {{ store.mrRegistrationProgress.iter }}
+                    · MI = {{ (-store.mrRegistrationProgress.mi).toFixed(4) }}
+                </div>
+                <div v-if="store.mrRegistrationParams && !store.mrRegistrationInProgress" class="mv-reg-status mv-reg-params">
+                    T = ({{ formatMm(store.mrRegistrationParams[0]) }},
+                          {{ formatMm(store.mrRegistrationParams[1]) }},
+                          {{ formatMm(store.mrRegistrationParams[2]) }}) mm
+                    R = ({{ formatDeg(store.mrRegistrationParams[3]) }},
+                          {{ formatDeg(store.mrRegistrationParams[4]) }},
+                          {{ formatDeg(store.mrRegistrationParams[5]) }})°
+                </div>
+            </section>
+
+            <!-- CT processing (寝台除去) — CT があるときだけ表示 -->
+            <section v-if="store.ctVolumeRef" class="mv-section">
+                <div class="mv-section-title">
+                    <v-icon icon="mdi-bed-empty" size="x-small" />
+                    CT processing
+                </div>
+                <div class="mv-btn-row">
+                    <v-btn
+                        v-if="!store.ctBodyMask"
+                        size="small"
+                        variant="tonal"
+                        color="primary"
+                        @click="onComputeBodyMask"
+                    >
+                        <v-icon icon="mdi-account" size="small" class="mr-1" />Remove CT bed
+                    </v-btn>
+                    <template v-else>
+                        <v-btn
+                            size="small"
+                            variant="flat"
+                            :color="store.ctBodyMaskEnabled ? 'primary' : undefined"
+                            @click="onToggleBodyMask"
+                        >
+                            <v-icon
+                                :icon="store.ctBodyMaskEnabled ? 'mdi-eye' : 'mdi-eye-off'"
+                                size="small"
+                                class="mr-1"
+                            />
+                            Bed removed: {{ store.ctBodyMaskEnabled ? 'ON' : 'OFF' }}
+                        </v-btn>
+                        <v-btn size="small" variant="text" @click="onClearBodyMask">
+                            Reset
+                        </v-btn>
+                    </template>
+                </div>
+            </section>
 
             <!-- Threshold -->
             <section class="mv-section">
@@ -517,6 +826,73 @@ const polygonModeProxy = computed({
                 </v-btn>
             </section>
 
+            <!-- Lesion table -->
+            <section v-if="store.finalMask" class="mv-section">
+                <div class="mv-section-title mv-section-title-row">
+                    <span>
+                        <v-icon icon="mdi-format-list-bulleted-square" size="x-small" />
+                        Lesions
+                        <span v-if="lesionTotals" class="mv-lesion-count">{{ lesionTotals.count }}</span>
+                    </span>
+                    <v-btn
+                        size="x-small"
+                        variant="text"
+                        :disabled="!lesionTotals"
+                        density="compact"
+                        @click="onExportLesionCsv"
+                    >
+                        <v-icon icon="mdi-download" size="x-small" class="mr-1" />CSV
+                    </v-btn>
+                </div>
+
+                <div v-if="!lesionTotals" class="mv-hint">
+                    No lesions yet — Apply threshold or paint a polygon
+                </div>
+                <template v-else>
+                    <div class="mv-lesion-table-wrap">
+                        <table class="mv-lesion-table">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Label</th>
+                                    <th class="num">SUVmax</th>
+                                    <th class="num">SUVmean</th>
+                                    <th class="num">MTV<br><span class="mv-th-unit">cc</span></th>
+                                    <th class="num">TLG</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr
+                                    v-for="(l, i) in lesionRows"
+                                    :key="l.componentId"
+                                    @click="onJumpToLesion(l)"
+                                    title="Click to jump crosshair"
+                                >
+                                    <td class="mv-mono">{{ i + 1 }}</td>
+                                    <td>
+                                        <span class="mv-color-swatch" :style="{ background: l.colorCss }" />
+                                        <span class="mv-lesion-label-name">{{ l.labelName }}</span>
+                                    </td>
+                                    <td class="num mv-mono mv-accent">{{ l.suvMax.toFixed(2) }}</td>
+                                    <td class="num mv-mono">{{ l.suvMean.toFixed(2) }}</td>
+                                    <td class="num mv-mono">{{ fmtMtv(l.mtvCc) }}</td>
+                                    <td class="num mv-mono">{{ fmtTlg(l.tlg) }}</td>
+                                </tr>
+                            </tbody>
+                            <tfoot>
+                                <tr>
+                                    <td colspan="2" class="mv-tfoot-label">Total</td>
+                                    <td class="num mv-mono mv-accent">{{ lesionTotals.maxSuv.toFixed(2) }}</td>
+                                    <td class="num mv-mono">—</td>
+                                    <td class="num mv-mono">{{ fmtMtv(lesionTotals.totalMtv) }}</td>
+                                    <td class="num mv-mono">{{ fmtTlg(lesionTotals.totalTlg) }}</td>
+                                </tr>
+                            </tfoot>
+                        </table>
+                    </div>
+                </template>
+            </section>
+
             <!-- Save / Load / Clean -->
             <section class="mv-section">
                 <div class="mv-btn-row">
@@ -552,6 +928,69 @@ const polygonModeProxy = computed({
     font-size: 12px;
     line-height: 1.5;
     border-bottom: 1px solid var(--mv-border);
+}
+
+/* MR-PET registration progress / params */
+.mv-reg-status {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--mv-text-dim);
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-feature-settings: 'tnum';
+    line-height: 1.4;
+}
+.mv-reg-params {
+    color: var(--mv-accent);
+}
+
+/* SUV calc status (warning + ok) */
+.mv-suv-warning {
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 6px 12px;
+    background: rgba(255, 175, 60, 0.10);
+    border-bottom: 1px solid var(--mv-border);
+    color: var(--mv-warning, #FFB454);
+    font-size: 11px;
+    line-height: 1.4;
+}
+.mv-suv-warning .v-icon {
+    margin-top: 1px;
+}
+.mv-suv-warning-text {
+    flex: 1;
+    color: var(--mv-text);
+}
+.mv-suv-warning-text strong {
+    color: var(--mv-warning, #FFB454);
+    font-weight: 600;
+}
+.mv-suv-reason {
+    display: block;
+    color: var(--mv-text-muted);
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 10px;
+    margin-top: 2px;
+}
+.mv-suv-ok {
+    display: flex;
+    align-items: center;
+    padding: 4px 12px;
+    font-size: 11px;
+    color: var(--mv-text-muted);
+    border-bottom: 1px solid var(--mv-border);
+}
+
+/* Auto-save status row (just under Linked PT) */
+.mv-autosave-line {
+    display: flex;
+    align-items: center;
+    padding: 4px 12px;
+    font-size: 11px;
+    color: var(--mv-text-muted);
+    border-bottom: 1px solid var(--mv-border);
+    font-feature-settings: 'tnum';
 }
 
 /* ★4: Linked PT 表示 */
@@ -719,5 +1158,122 @@ const polygonModeProxy = computed({
     letter-spacing: 0;
     margin-left: 6px;
     font-size: 11px;
+}
+
+/* Lesion table */
+.mv-section-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.mv-lesion-count {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 6px;
+    background: var(--mv-accent-dim, rgba(0,212,170,0.2));
+    color: var(--mv-accent);
+    border-radius: 8px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0;
+    text-transform: none;
+}
+.mv-lesion-table-wrap {
+    max-height: 240px;
+    overflow: auto;
+    border: 1px solid var(--mv-border);
+    border-radius: 3px;
+}
+table.mv-lesion-table {
+    border-collapse: collapse;
+    font-size: 11px;
+    width: 100%;
+    table-layout: fixed;
+}
+/* Column widths: #(22) Label(flex) SUVmax(46) SUVmean(50) MTV(46) TLG(56) */
+table.mv-lesion-table th:nth-child(1),
+table.mv-lesion-table td:nth-child(1) { width: 22px; }
+table.mv-lesion-table th:nth-child(3),
+table.mv-lesion-table td:nth-child(3) { width: 46px; }
+table.mv-lesion-table th:nth-child(4),
+table.mv-lesion-table td:nth-child(4) { width: 50px; }
+table.mv-lesion-table th:nth-child(5),
+table.mv-lesion-table td:nth-child(5) { width: 46px; }
+table.mv-lesion-table th:nth-child(6),
+table.mv-lesion-table td:nth-child(6) { width: 56px; }
+table.mv-lesion-table thead th {
+    position: sticky;
+    top: 0;
+    background: var(--mv-surface-2);
+    color: var(--mv-text-dim);
+    text-align: left;
+    font-weight: 600;
+    padding: 4px 4px;
+    border-bottom: 1px solid var(--mv-border);
+    font-size: 10px;
+    text-transform: none;
+    letter-spacing: 0;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+table.mv-lesion-table th.num,
+table.mv-lesion-table td.num {
+    text-align: right;
+}
+table.mv-lesion-table .mv-th-unit {
+    color: var(--mv-text-muted);
+    font-weight: 400;
+    text-transform: none;
+    font-size: 9px;
+}
+table.mv-lesion-table tbody tr {
+    cursor: pointer;
+    transition: background 0.1s;
+}
+table.mv-lesion-table tbody tr:hover {
+    background: var(--mv-surface-2);
+}
+table.mv-lesion-table tbody tr:nth-child(even) {
+    background: rgba(255,255,255,0.012);
+}
+table.mv-lesion-table tbody tr:nth-child(even):hover {
+    background: var(--mv-surface-2);
+}
+table.mv-lesion-table td {
+    padding: 3px 4px;
+    border-bottom: 1px solid var(--mv-border);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+table.mv-lesion-table td.num,
+table.mv-lesion-table th.num {
+    font-feature-settings: 'tnum';
+}
+table.mv-lesion-table .mv-color-swatch {
+    width: 8px;
+    height: 8px;
+    border-radius: 1px;
+    display: inline-block;
+    vertical-align: middle;
+    margin-right: 4px;
+}
+table.mv-lesion-table .mv-lesion-label-name {
+    color: var(--mv-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+table.mv-lesion-table tfoot td {
+    background: var(--mv-surface-2);
+    font-weight: 600;
+    border-top: 1px solid var(--mv-border);
+    border-bottom: none;
+}
+table.mv-lesion-table .mv-tfoot-label {
+    color: var(--mv-text-dim);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.04em;
 }
 </style>

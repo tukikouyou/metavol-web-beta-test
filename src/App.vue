@@ -133,6 +133,18 @@
       </v-btn>
 
       <v-btn
+        :class="['mv-tool-btn', { 'is-active': voxelInspector }]"
+        variant="text"
+        size="small"
+        @click="voxelInspector = !voxelInspector"
+      >
+        <v-icon icon="mdi-eyedropper" />
+        <v-tooltip activator="parent" location="bottom">
+          {{ voxelInspector ? 'Voxel inspector ON (hover to read voxel values)' : 'Voxel inspector OFF (Ctrl+Shift+D)' }}
+        </v-tooltip>
+      </v-btn>
+
+      <v-btn
         class="mv-tool-btn"
         variant="text" size="small"
         @click="changeImageBoxSize(-50)"
@@ -207,6 +219,7 @@
         v-model:tileN="tileN"
         v-model:syncImageBox="syncImageBox"
         v-model:closingImages="closingImages"
+        v-model:debugMode="voxelInspector"
       />
     </v-main>
   </v-app>
@@ -251,6 +264,7 @@ const imageBoxH = ref(h);
 const closingImages = ref(false);
 const tileN = ref(getTileN());
 const syncImageBox = ref(false);
+const voxelInspector = ref(false);
 
 const tools = [
   { value: 'window',     icon: 'mdi-contrast-circle',       label: 'Window/Level' },
